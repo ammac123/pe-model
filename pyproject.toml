@@ -1,0 +1,32 @@
+[project]
+name = "mortgage-elasticity"
+version = "0.1.0"
+description = "Binary logit share model for mortgage price elasticity: estimation pipeline"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "statsmodels>=0.14",
+    "openpyxl>=3.1",
+]
+
+[project.optional-dependencies]
+# Full hierarchical Bayesian pooling (step 5b). Heavy install; optional.
+bayes = ["pymc>=5.10"]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+elasticity = "mortgage_elasticity.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.32,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

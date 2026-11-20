@@ -1,0 +1,904 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=25mm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+
+\newtheorem{proposition}{Proposition}[section]
+\newtheorem{lemma}[proposition]{Lemma}
+\theoremstyle{remark}
+\newtheorem*{remark}{Remark}
+
+\setlength{\emergencystretch}{3em}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\takeaway}[1]{\par\medskip\noindent\fbox{\parbox{\dimexpr\linewidth-2\fboxsep-2\fboxrule\relax}{\textbf{Plain-English takeaway.} #1}}\par\medskip}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\operatorname{Var}}
+\newcommand{\Cov}{\operatorname{Cov}}
+\newcommand{\plim}{\operatorname*{plim}}
+\newcommand{\logit}{\operatorname{logit}}
+\newcommand{\rs}{r^{*}}
+\newcommand{\one}{\mathbf{1}}
+\DeclareMathOperator*{\argmin}{arg\,min}
+
+\title{Mortgage price-elasticity estimator:\\ the mathematics behind the code}
+\author{Technical companion to \texttt{docs/overview.md}}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{How to read this document}
+Section~$N$ expands step~$N$ of \texttt{docs/overview.md}. Every formula names the function that
+implements it, as \code{module.function} under \code{src/mortgage_elasticity/}. Defaults quoted come from
+\code{config.py} (\code{Priors}, \code{Settings}). The text describes what the code does now. Where
+the code makes an approximation or a judgment call, the text says so. Each section ends with a boxed
+takeaway that you can pass on to business users.
+
+\tableofcontents
+
+%=====================================================================
+\section{Setup and notation}\label{sec:setup}
+
+\paragraph{Data.} Segments $k=1,\dots,K$ are product/customer cells defined identically in our data
+and the market data (e.g.\ owner-occupier P\&I LVR$\le$80). Periods $t=1,\dots,n$ are weeks or months,
+labelled by their \emph{end} date. The panel is balanced, which \code{panel.load_panel} enforces. For each
+$(k,t)$ we observe market lodgements $M_{kt}$ (\code{lodg_mkt}), our lodgements $L_{kt}$
+(\code{lodg_us}), our applications $A_{kt}$ (\code{apps}), and two cumulative price paths since the
+panel start in basis points (bp), with $+$ meaning dearer. These are $H_{kt}$, the headline rate
+(\code{headline_cum_bps}), and $D_{kt}$, the average discretionary discount
+(\code{discretionary_cum_bps}). For $D$, $+$ means less discount.
+
+\paragraph{Share and logit share.} \code{panel.load_panel} computes
+\[
+  s_{kt}=\frac{L_{kt}}{M_{kt}}\in(0,1),\qquad y_{kt}=\logit s_{kt}=\log\frac{s_{kt}}{1-s_{kt}} ,
+\]
+and rejects any row with $s\notin(0,1)$. The logit share is the left-hand side of every estimating
+equation. Its sampling noise follows from the delta method. If $L_{kt}\mid M_{kt}\sim\mathrm{Bin}(M_{kt},\pi_{kt})$,
+then $\Var(s_{kt})\approx\pi(1-\pi)/M$ and $\tfrac{d}{ds}\logit s = 1/(s(1-s))$. So
+\begin{equation}\label{eq:sampling}
+  \Var(y_{kt})\approx\frac{1}{M_{kt}\,\pi_{kt}(1-\pi_{kt})}.
+\end{equation}
+For example, $M=4000$ and $\pi=0.10$ give a standard deviation of about $0.053$ per period. This
+noise differs across segments because of size and share. It matters in \S\ref{sec:events}.
+
+\paragraph{Conversion assumption.} Business users plan in applications, but the model is
+estimated on lodgements. The bridge is $A_{kt}=c_k L_{kt}$ with a conversion ratio $c_k$ that is
+constant over time. Then $A_{kt}/A_{k0}=L_{kt}/L_{k0}=s_{kt}/s_{k0}$ whenever the market total is
+also fixed (\S\ref{sec:excel}). \code{panel.conversion_report} checks this assumption. It reports, per segment,
+the mean of $c_{kt}=A_{kt}/L_{kt}$, its coefficient of variation, and the OLS slope of $c_{kt}$ on
+$t$ divided by the mean (\code{conv_trend_per_period_pct}). A material trend means that a
+change in lodgement share is not a change in application share.
+
+\paragraph{Notation.} Symbols are used with one meaning throughout.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}lll@{}}
+\toprule
+Symbol & Meaning & Code \\
+\midrule
+$k$, $t$, $K$, $n$ & segment, period, number of segments, number of periods & \code{segment}, \code{period}\\
+$s_{kt}$, $y_{kt}$ & our lodgement share, logit share & \code{share}, \code{y}\\
+$H_{kt}$, $D_{kt}$ & our cumulative headline / discretionary change (bp) & \code{headline_cum_bps}\\
+$q_{jkt}$ & competitor $j$'s effective rate, $100\cdot$rate$-$adj (bp) & \code{eff_bps}\\
+$\rs_{kt}$ & soft-min market benchmark (bp) & \code{r_star_bps}\\
+$T_k$ & soft-min temperature (bp), $T_k=1/\hat\beta^{FE}_k$ by default & \code{softmin_T_bps}\\
+$w_{jkt}$ & lender $j$'s weight in $\rs$ (softmax) & \code{weight}\\
+$\mathcal L_h$, $\phi_h$ & partial-adjustment lag with half-life $h$; speed $\phi_h=1-2^{-1/h}$ & \code{model.lag}\\
+$\kappa$, $h_H$, $h_D$ & discretionary shading; headline / discretionary half-lives & \code{kappa}, \code{hH}, \code{hD}\\
+$x_{kt}$ & perceived price (bp, $+$ = dearer) & \code{x}\\
+$\alpha_k$, $\alpha_{kt}$ & segment constant; time-varying natural position & \code{alpha_level}\\
+$\delta_t$ & period effect (common to all segments) & \code{C(period_id)}\\
+$\beta_k$ & price sensitivity of the logit share, per bp & \code{beta_*}\\
+$e_{kt}$, $\varepsilon_{kt}$ & regression error; idiosyncratic (sampling) noise & \\
+$s_{0k}$, $u$ & baseline share; judgment uplift per bp ($0.08$) & \code{s0}, \code{Priors.u}\\
+$\beta_{0k}$, $f$ & prior mean $u/(1-s_{0k})$; prior sd as a fraction of it ($0.30$) & \code{beta_prior}, \code{prior_sd_frac}\\
+$\hat\beta^{FE}_k$, $\hat\beta^{\rm hier}_k$ & panel (two-way FE) and hierarchical panel (PyMC) estimates & \code{beta_fe}, \code{beta_hier}\\
+$\hat\beta_e$, $\mathrm{se}_e$ & one event's estimate and standard error & \code{beta_e}, \code{beta_e_se}\\
+$\hat\beta^{\rm post}_k$, $\hat\beta^{\rm pool}_k$ & judgment prior updated by usable events: per segment, pooled & \code{beta_post}, \code{beta_pool}\\
+$n_{\rm pre}$, $n_{\rm post}$, $n_c$ & event pre/post window lengths; number of controls & \code{event_pre}, \code{event_post}\\
+$\rho_k$, $\lambda$ & ratio $\beta_k/\beta_{0k}$; shared scale & \code{shared_scale}\\
+$\zeta_k$, $\tau$ & segment deviation of $\rho_k$; its sd ($0.15$) & \code{segment_sd_frac}\\
+$\omega_k$ & own weight in the pooled posterior & \code{own_weight}\\
+$\Lambda(z)$ & logistic function $1/(1+e^{-z})$ & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\takeaway{We measure our share of the market's lodgements in each segment every week or month, and
+assume applications move in step with lodgements. Everything that follows explains how that share
+responds to our price relative to the market's.}
+
+%=====================================================================
+\section{Customer choice and the market benchmark}\label{sec:choice}
+
+\subsection{From random utility to the multinomial logit}
+In segment $k$ and period $t$, borrower $i$ chooses one lender $j$ from the set $\{us\}\cup\mathcal J$,
+where $\mathcal J$ is the set of competitors. The borrower gets utility
+\[
+  U_{ij}=a_j-b\,r_j+\epsilon_{ij},\qquad \epsilon_{ij}\overset{iid}{\sim}\text{Gumbel}(0,1),\quad
+  F(\epsilon)=\exp(-e^{-\epsilon}).
+\]
+Here $a_j$ is lender $j$'s non-price appeal, $r_j$ its rate in bp, and $b>0$ the price
+coefficient. Indices $k,t$ are dropped in this subsection.
+
+\begin{proposition}[Multinomial logit]\label{prop:mnl}
+With $V_j=a_j-br_j$, $\Pr(i\text{ chooses }j)=e^{V_j}/\sum_{l}e^{V_l}$.
+\end{proposition}
+\begin{proof}
+Lender $j$ is chosen iff $\epsilon_{il}<V_j-V_l+\epsilon_{ij}$ for all $l\ne j$. Condition on
+$\epsilon_{ij}=\epsilon$ and use independence:
+\[
+\Pr(j)=\int_{-\infty}^{\infty}e^{-\epsilon}e^{-e^{-\epsilon}}\prod_{l\ne j}\exp\!\big(-e^{-\epsilon}e^{V_l-V_j}\big)\,d\epsilon
+=\int_{-\infty}^{\infty}e^{-\epsilon}\exp\!\big(-e^{-\epsilon}S_j\big)\,d\epsilon,
+\]
+where $S_j=\sum_l e^{V_l-V_j}$ (the $l=j$ term is the factor $e^{-e^{-\epsilon}}$). Substituting
+$z=e^{-\epsilon}$ gives $\int_0^\infty e^{-zS_j}dz=1/S_j$.
+\end{proof}
+
+With many borrowers, our share is the choice probability plus the sampling noise of
+\eqref{eq:sampling}. The market here is all lodgements in the segment. There is no
+``outside good'' (not borrowing), so the market total is taken as given, as in \S\ref{sec:excel}.
+
+\subsection{Our share against the field}
+Write $P_{us}$ for our choice probability. Then
+\[
+\logit P_{us}=\log\frac{e^{V_{us}}}{\sum_{j\in\mathcal J}e^{V_j}}
+= a_{us}-b\,r_{us}-\log\sum_{j\in\mathcal J}e^{a_j-br_j}.
+\]
+Define the \emph{quality-adjusted} rate $q_j=r_j-a_j/b$ and the temperature $T=1/b$. Then
+\begin{equation}\label{eq:binary}
+\boxed{\;\logit P_{us}=a_{us}-b\,(r_{us}-\rs),\qquad
+\rs=-\frac1b\log\sum_{j\ne us}e^{a_j-br_j}=-T\log\sum_{j\ne us}e^{-q_j/T}.\;}
+\end{equation}
+This identity is exact. All competitors collapse into one number $\rs$, the logit
+\emph{inclusive value} expressed in rate units. Our logit share is linear in our rate's gap to it, with
+slope $b$. In the estimating equations $b$ is called $\beta$, and the two are the same parameter.
+
+\subsection{$\rs$ is a soft minimum}
+\begin{proposition}\label{prop:softmin}
+Let $q_1,\dots,q_N$ be quality-adjusted rates, $q_{\min}=\min_j q_j$, $T>0$ and
+$\rs(q)=-T\log\sum_j e^{-q_j/T}$. Then:
+\begin{enumerate}
+\item[(a)] $q_{\min}-T\log N\le \rs\le q_{\min}$, with the right-hand equality iff $N=1$.
+\item[(b)] $\rs\to q_{\min}$ as $T\to0$, uniformly, with error at most $T\log N$.
+\item[(c)] Translation equivariance: $\rs(q+c\one)=\rs(q)+c$.
+\item[(d)] Adding a lender with rate $q_{N+1}$ strictly lowers $\rs$, by
+$T\log\!\big(1+e^{(\rs-q_{N+1})/T}\big)$.
+\item[(e)] If all $N$ lenders are tied at $q$, then $\rs=q-T\log N$.
+\item[(f)] $\partial\rs/\partial q_j=w_j:=e^{-q_j/T}/\sum_l e^{-q_l/T}$, which are softmax weights summing to one.
+\item[(g)] Variational form: $\rs=\min_{w\in\Delta_N}\big\{\sum_j w_jq_j-T\,\mathcal H(w)\big\}$ with
+$\mathcal H(w)=-\sum_j w_j\log w_j$. The minimiser is the softmax $w$ of (f).
+\end{enumerate}
+\end{proposition}
+\begin{proof}
+(a) $e^{-q_{\min}/T}\le\sum_j e^{-q_j/T}\le Ne^{-q_{\min}/T}$. Apply $-T\log(\cdot)$, which is decreasing.
+(b) follows from (a). (c) $\sum_j e^{-(q_j+c)/T}=e^{-c/T}\sum_je^{-q_j/T}$.
+(d) The new sum is $\Sigma+e^{-q_{N+1}/T}$ with $\Sigma=e^{-\rs/T}$, so
+$\rs_{\rm new}=-T\log\Sigma-T\log(1+e^{-q_{N+1}/T}/\Sigma)$.
+(e) $\sum_je^{-q/T}=Ne^{-q/T}$. (f) Differentiate.
+(g) For any $w$ in the simplex, concavity of $\log$ (Jensen) gives
+$\log\sum_j e^{-q_j/T}=\log\sum_j w_j\frac{e^{-q_j/T}}{w_j}\ge\sum_j w_j\big(-q_j/T-\log w_j\big)$,
+with equality iff $e^{-q_j/T}/w_j$ is constant, i.e.\ $w$ is the softmax. Multiply by $-T$.
+\end{proof}
+
+\paragraph{Interpretation.} By (g), $\rs$ is a softmax-weighted average rate minus a ``variety bonus''
+$T\mathcal H(w)$. With small $T$ (price-sensitive borrowers) it hugs the cheapest lender. With large $T$
+the borrower values the spread of options. By (f), a lender's influence on the benchmark is its
+softmax weight. A lender priced $3T$ above the cheapest carries $e^{-3}\approx5\%$ of the
+cheapest one's weight.
+
+\paragraph{Why entry and exit matter.} By (d) and (e), $\rs$ depends on the \emph{number} of lenders as
+well as their rates. On the synthetic sample $T\approx7$--$12$\,bp. With $T=11$\,bp and 7 tied lenders
+the offset is $T\log7\approx21$\,bp, and going from 6 to 8 lenders lowers $\rs$ by
+$T\log(8/6)\approx3$\,bp with no rate moving. A constant offset is absorbed by $\alpha_k$
+(\S\ref{sec:fe}). A \emph{change} in $N$ moves $x$. In the model this movement is real: a new
+option takes share under IIA. If the change is a data artefact, such as a lender missing from the file or a
+forward-fill running out, it is a spurious price move. \code{panel.add_benchmark} warns when $N$
+varies within a segment, when $N<$ \code{min_lenders} (3), and when a rate sits more than 100\,bp below the
+period median.
+
+\subsection{Why not a weighted average of competitor rates?}
+A fixed-weight average $\bar q=\sum_j\pi_j q_j$ contradicts \eqref{eq:binary} in three ways.
+(i) Its sensitivity to lender $j$ is a fixed $\pi_j$, whereas the model's is $w_j$, which is close to $0$ for an
+uncompetitive lender. An expensive lender's repricing moves $\bar q$ but not our share.
+(ii) Adding an expensive lender raises $\bar q$, while the model says it (weakly) lowers $\rs$.
+(iii) For equal weights,
+$\rs+T\log N=-T\log\big(\tfrac1N\sum_je^{-q_j/T}\big)\to\bar q$ as $T\to\infty$, by a first-order expansion
+of the exponential. So the plain average is the benchmark of borrowers who barely react to rate
+differences between lenders. That contradicts the premise that $\beta$ is large enough to matter.
+
+\subsection{What the code computes}
+\begin{itemize}
+\item \textbf{Effective rate} (\code{panel.load_competitors}): $q_{jkt}=100\cdot\code{rate_pct}-\code{adj_bps}$,
+with $\code{adj_bps}>0$ meaning value to the customer such as cashback. In \eqref{eq:binary} this sets
+$a_j/b=\code{adj}_j$. All other non-price appeal is assumed equal across competitors, and any common part
+of it shifts $\rs$ by a constant. Our own $a_{us}$ is the segment constant.
+\item \textbf{Eligibility}: rows with \code{eligible}=FALSE get $\mathrm{eff}=+\infty$ and lenders in
+\code{exclude_lenders} are dropped. The $+\infty$ marker gives the lender weight $e^{-\infty/T}=0$ in \eqref{eq:binary}, and it
+stops \code{panel._wide}, which forward-fills missing rates for up to \code{comp_ffill_periods} (8) periods, from carrying
+the last eligible rate into an ineligible period. In a change log, a period's rate averages only the eligible days; a
+period that is ineligible on every day is absent.
+\item \textbf{Temperature} (\code{cli.cmd_estimate}): the model requires $T_k=1/\beta_k$, so $T_k$ is in bp.
+The code starts at $T_k=1/\beta_{0k}$, the prior of \S\ref{sec:prior}, runs steps 4--7, then re-solves
+$T_k=1/\hat\beta^{FE}_k$, rebuilds $\rs$ and runs steps 4--7 again (\code{Settings.resolve_T}). This is one step of
+the fixed-point iteration $T\mapsto1/\hat\beta(T)$. The TWFE estimate is used rather than $\hat\beta^{\rm pool}$ because it
+does not depend on the event log, which is thin and mostly mixed-motive: with few trustworthy events $\hat\beta^{\rm pool}$
+stays near the prior, $T$ is never corrected, and $\hat\beta^{FE}$ comes out about 20\% low. A segment whose $\hat\beta^{FE}$ is
+not finite and positive falls back to $1/\hat\beta^{\rm pool}_k$, then to $1/\beta_{0k}$, with a warning. A second step
+moves $\hat\beta^{FE}$ by 4--14\% (median over segments, by seed) in the simulation with competitor specials, so it is
+not run. A wrong $T$ is a misspecification of $x$ itself, so no estimator's standard error reflects it. \code{Settings.softmin_T_bps} overrides this with one fixed $T$ for all segments, and $T=0$ gives the
+hard minimum.
+\item \textbf{Numerics} (\code{model.softmin_rate}): with $z_j=-q_j/T$ and $m=\max_j z_j$, the code
+computes $\rs=-T\big(m+\log\sum_je^{z_j-m}\big)$. The largest term becomes $e^0=1$, so the sum cannot
+underflow to zero. Without the shift, $e^{-600/1}$ is $0$ in double precision. Absent lenders
+(NaN) are set to $z=-\infty$ and contribute $0$. A row with no lenders is an error.
+\item \textbf{Period convention} (\code{panel._per_period}): all rates are day-weighted averages over the
+period $(t-1,t]$. A change log is expanded to a daily step function, forward-filled from each
+effective date, and averaged over the days of each period. The first period is one median spacing
+long, and days before a lender's first change are unknown and skipped. Why the convention matters:
+suppose a move of $\Delta$ takes effect a fraction $\theta$ of the way through a period. Its day-weighted
+average moves by $(1-\theta)\Delta$ in that period, while an end-of-period rate moves by $\Delta$. Mixing
+the two conventions creates a spurious one-period gap of $\theta\Delta$ around every common move.
+\item \emph{Approximation:} $\rs$ is the soft-min of period-average rates. It is not the period
+average of daily soft-mins. Because $\rs$ is concave (its Hessian is $-(\mathrm{diag}\,w-ww^\top)/T\preceq0$),
+the two differ only when lenders reprice within a period, and the difference is small for weekly data.
+\end{itemize}
+
+\takeaway{Borrowers compare us with the whole field, but mostly with the cheapest lenders. The
+benchmark $\rs$ is a ``soft cheapest rate'': it follows the keenest lenders, ignores the uncompetitive ones,
+and falls a little whenever another option appears.}
+
+%=====================================================================
+\section{The perceived price $x$}\label{sec:x}
+
+\subsection{Partial adjustment}
+Customers and brokers notice price changes gradually. \code{model.lag} applies, per segment,
+\[
+p_t=p_{t-1}+\phi_h\,(v_t-p_{t-1}),\qquad p_0:=v_1,\qquad \phi_h=1-2^{-1/h}.
+\]
+\begin{lemma}\label{lem:lag}
+(i) Unrolling gives the geometric kernel
+$\mathcal L_h(v)_t=(1-\phi)^{t-1}v_1+\phi\sum_{s=0}^{t-2}(1-\phi)^s v_{t-s}$. The weights sum to $1$,
+so $\mathcal L_h$ is linear and $\mathcal L_h(v+c)=\mathcal L_h(v)+c$ for any constant $c$.
+(ii) After a step of size $\Delta$ in $v$ at period $\tau$, the remaining gap $v_t-p_t$ is
+$(1-\phi)^{t-\tau+1}\Delta$, so half of the move is perceived after $h$ periods, counting period $\tau$ itself.
+(iii) The mean lag is $(1-\phi)/\phi$.
+\end{lemma}
+\begin{proof}
+(i) Write $p_t=(1-\phi)p_{t-1}+\phi v_t$ and iterate. The weights sum to
+$(1-\phi)^{t-1}+\phi\frac{1-(1-\phi)^{t-1}}{\phi}=1$. (ii) The gap obeys
+$g_t=(1-\phi)g_{t-1}$, with $g_{\tau-1}=\Delta$ just before the step is absorbed. Setting
+$(1-\phi)^h=\tfrac12$ gives $\phi=1-2^{-1/h}$. (iii) The kernel on $v_{t-s}$ is $\phi(1-\phi)^s$, whose mean is
+$(1-\phi)/\phi$.
+\end{proof}
+Under the priors, $h_H=2$ gives $\phi\approx0.29$ (mean lag $2.4$ periods), and $h_D=8$ gives $\phi\approx0.083$
+(mean lag $11$ periods). Starting at $p_0=v_1$ assumes the panel begins in steady state.
+
+\subsection{Gap model}
+With competitor data, \code{panel.add_perceived_price} sets
+\begin{equation}\label{eq:x}
+x_{kt}=\mathcal L_{h_H}(H_k)_t+\kappa\,\mathcal L_{h_D}(D_k)_t-\mathcal L_{h_H}\big(\rs_k-\rs_{k1}\big)_t .
+\end{equation}
+Why it is \eqref{eq:binary}: our perceived rate is $r_{us,kt}=r_{us,k1}+H_{kt}+\kappa D_{kt}$, so
+$r_{us}-\rs=x_{kt}+(r_{us,k1}-\rs_{k1})$ after lags. \emph{Subtracting $\rs_{k1}$ is harmless.} By
+Lemma~\ref{lem:lag}(i), $\mathcal L(\rs-\rs_{k1})=\mathcal L(\rs)-\rs_{k1}$, which shifts $x_{k\cdot}$ by a
+segment constant. That constant is absorbed by $\alpha_k$ in \S\ref{sec:fe}, cancels in the before--after
+differences of \S\ref{sec:events}, and drops out of the Excel $x$, which is a change. It does not cancel when the lag
+starts from zero, which is why \code{model.lag} starts at $v_1$. The level $\rs$ is lagged with the
+\emph{headline} half-life. That is a judgment: competitor moves are taken to be noticed as fast as our headline moves.
+
+\paragraph{What $\kappa$ means.} A 1\,bp change in our average discretionary discount moves the
+perceived price by $\kappa$\,bp. Discounts reach only some borrowers, are negotiated after the
+comparison stage, and are less visible than the headline rate. So $\kappa<1$ is the average
+``visibility'' of the discount, with prior $0.5$. It is profiled over a grid in \S\ref{sec:fe}.
+
+\subsection{Move model (no competitor file)}
+Without competitors, $x^{\rm own}_{kt}=\mathcal L_{h_H}(H_k)_t+\kappa\mathcal L_{h_D}(D_k)_t$. With
+\code{demean_x_by_period} (the default), $x_{kt}=x^{\rm own}_{kt}-\frac1K\sum_j x^{\rm own}_{jt}$.
+
+\emph{What demeaning removes.} It removes every component common to all segments in a period: RBA
+pass-through that everyone makes at once, and our own bank-wide moves. Without competitor data, our
+bank-wide moves cannot be separated from market moves.
+\emph{When it matters.} For a common slope $\beta$, the subtracted term is a function of $t$ only and is
+absorbed by $\delta_t$ (Frisch--Waugh--Lovell, \S\ref{sec:fe}), so $\hat\beta$ is unchanged. With
+segment-specific slopes it changes the regressors. It encodes the modelling choice that common
+moves have no effect on $y$ beyond $\delta_t$.
+\emph{Caveats.} (i) Our genuine bank-wide repricing is discarded as information. (ii) Competitors'
+segment-specific moves are invisible and stay in the error. (iii) A segment whose own price never moved
+receives a ``borrowed'' $x=-\bar x_t$. \code{fe.betas_from_fit} blanks its $\beta^{FE}$.
+(iv) In event studies, demeaning cancels from $dx$ but leaves controls' $x$ moving by $-\Delta/K$
+(\S\ref{sec:events}).
+
+\subsection{Unseen competitor discounts: measurement error}
+We see competitors' headline rates and \code{adj}, but not their discretionary discounts. So the
+observed $x$ is $x^{\rm obs}=x+m$, where $m$ is the (lagged, weighted) error in $\rs$. To first order,
+$m_{kt}\approx\sum_j w_{jkt}\,\Delta\text{disc}_{jkt}$. Take the simple regression $y=a-\beta x+e$ with
+$m\perp(x,e)$, so that the error is classical. Then
+\[
+\Cov(y,x^{\rm obs})=-\beta\Var(x),\qquad \Var(x^{\rm obs})=\Var(x)+\Var(m),
+\]
+so
+\[
+\plim\hat\beta=\beta\,\frac{\Var(x)}{\Var(x)+\Var(m)}\in(0,\beta].
+\]
+In the two-way model, both variances refer to the two-way-demeaned components (FWL,
+\S\ref{sec:fe}). Write $m_{kt}=m_k+m_t+\tilde m_{kt}$. Persistent differences in discounting between segments ($m_k$)
+are absorbed by $\alpha_k$. Market-wide swings in discounting ($m_t$) are absorbed by $\delta_t$,
+exactly when slopes are equal. Only the segment-specific, time-varying part $\tilde m$ attenuates
+$\beta^{FE}$. The error is not classical if lenders trade headline against discount, for example by raising the
+headline and widening discounts together. Then $m$ is correlated with the observed rate moves, and the
+bias can go either way and be larger. In the event
+estimator the error enters the denominator $dx$ (\S\ref{sec:events}). It adds variance that the
+reported SE does not include.
+
+\takeaway{$x$ is how much dearer we look than when the data starts, relative to the market, after
+allowing customers time to notice. Headline changes register within a few weeks, discount changes
+more slowly and only partly. Competitor discounts we cannot see blur $x$, which makes the panel
+estimate understate sensitivity.}
+
+%=====================================================================
+\section{Two-way fixed effects}\label{sec:fe}
+
+\subsection{Model}
+\code{fe.fit_twfe} runs OLS in \code{statsmodels} with the formula
+\begin{center}\code{y ~ C(segment) + C(period_id) + C(segment):x},\end{center}
+that is,
+\begin{equation}\label{eq:twfe}
+y_{kt}=\alpha_k+\delta_t-\beta_k x_{kt}+e_{kt},
+\end{equation}
+with one slope per segment and HC1 standard errors. \code{fe.betas_from_fit} reports
+$\beta_k^{FE}=-\hat\gamma_k$, where $\hat\gamma_k$ is the coefficient on $\one\{k\}x$.
+
+\subsection{What variation identifies $\beta$: Frisch--Waugh--Lovell}
+Let $M$ be the annihilator of the segment and period dummies. In a balanced panel $M$ is two-way
+demeaning, $(Mv)_{kt}=v_{kt}-\bar v_{k\cdot}-\bar v_{\cdot t}+\bar v_{\cdot\cdot}$. By FWL, the slope
+coefficients equal those from regressing $My$ on the demeaned slope regressors.
+
+\paragraph{Common slope.} If $\beta_k\equiv\beta$, the regressor is $Mx$. Decompose
+$x_{kt}=g_k+c_t+\xi_{kt}$. Then $Mx=M\xi$: segment levels $g_k$ and every common time path $c_t$ are
+removed exactly, and $\hat\beta=-\langle M\xi,My\rangle/\|M\xi\|^2$. Only segment-specific deviations
+from the common path identify $\beta$.
+
+\paragraph{Segment-specific slopes.} The regressors are $z^{(k)}_{jt}=\one\{j=k\}x_{kt}$.
+\begin{lemma}\label{lem:fwl}
+$(Mz^{(k)})_{jt}=\big(\one\{j=k\}-\tfrac1K\big)(x_{kt}-\bar x_{k\cdot})$ and $\sum_k Mz^{(k)}=Mx$.
+\end{lemma}
+\begin{proof}
+$\bar z^{(k)}_{j\cdot}=\one\{j=k\}\bar x_{k\cdot}$, $\bar z^{(k)}_{\cdot t}=x_{kt}/K$ and
+$\bar z^{(k)}_{\cdot\cdot}=\bar x_{k\cdot}/K$. Substitute these into $M$ and sum over $k$.
+\end{proof}
+Each slope is informed by its own segment's time-demeaned price path. The $-1/K$ copies in other
+rows reflect that $\delta_t$ is estimated partly from segment $k$ itself.
+
+\begin{proposition}[Common moves with unequal slopes]\label{prop:common}
+Let $x_{kt}=g_k+c_t+\xi_{kt}$ with $c$ non-constant.
+(i) If $\xi\equiv0$, then $\sum_kMz^{(k)}=0$. The design loses exactly one rank, the direction
+$\beta_k\mapsto\beta_k+\gamma$ for all $k$, so only contrasts $\beta_k-\beta_j$ are identified.
+(ii) In general, reparametrise $\beta_k=\bar\beta+(\beta_k-\bar\beta)$. The level $\bar\beta$ is the
+coefficient on $Mx=M\xi$, so $\Var(\hat{\bar\beta})\ge\sigma^2/\|M\xi\|^2$ under homoskedastic iid errors.
+The level is learned only from segment-specific variation. The common component informs only the contrasts.
+\end{proposition}
+\begin{proof}
+(i) Lemma~\ref{lem:fwl} and $M(g+c)=0$. Equivalently, adding $\gamma$ to every $\beta_k$ adds
+$-\gamma(g_k+c_t)$ to the mean, which $\alpha_k+\delta_t$ absorbs. (ii) In a multiple regression the
+variance of a coefficient is $\sigma^2$ over the squared norm of its regressor after partialling out
+the others. That is at most the regressor's own squared norm, here $\|M\xi\|^2$.
+\end{proof}
+
+\paragraph{Bank-wide pass-through timing.} Suppose we pass an RBA change on ten days after the majors in every
+segment, with the same lags. Our part of $x$ then moves by the same $c_t$ in all segments. With equal
+slopes, $\delta_t$ absorbs it fully. With unequal slopes it informs only contrasts, and it
+does so correctly only if the RBA move does not itself shift demand differently across segments,
+for example fixed versus variable. Only \emph{timing that differs by segment}, ours or competitors', identifies the
+level of $\beta$.
+
+\subsection{The rank check}
+There are $p=1+(K-1)+(n-1)+K$ columns. A segment whose $x$ never moves (``flat'') has a slope column
+that is either zero or collinear with its dummy, so it costs one rank and is expected
+(\code{fe._flat_segments}). \code{fe.fit_twfe} raises if every segment is flat, or if
+$\mathrm{rank}<p-n_{\rm flat}$. The second condition is the case of Proposition~\ref{prop:common}(i): $x$ has no
+cross-segment variation after period effects. Without the check, \code{statsmodels} would return a
+pseudo-inverse solution with an arbitrary common shift in all $\beta_k$.
+
+\subsection{Endogeneity from reactive repricing}
+Let the true natural position drift, $\alpha_{kt}=\alpha_{k,t-1}+\eta_{kt}$, a random walk. The fixed
+effect captures only its sample mean, so the error is
+$e_{kt}=(\alpha_{kt}-\bar\alpha_{k\cdot})+\varepsilon_{kt}$. Suppose that, besides exogenous moves
+$x^{\rm exo}$, we cut price after weak volume (as \code{simulate --reactive} does). Linearised,
+\[
+x_{kt}=x^{\rm exo}_{kt}+\psi\,\alpha_{k,t-1},\qquad\psi>0
+\]
+(a low natural position leads to a lower price). For a common slope, after FWL,
+\[
+\plim\big(-\hat\beta\big)=-\beta+\frac{\Cov(\tilde x,\tilde e)}{\Var(\tilde x)},\qquad
+\Cov(\tilde x_{kt},\tilde e_{kt})=\psi\Cov(\tilde\alpha_{k,t-1},\tilde\alpha_{kt})=\psi\Var(\tilde\alpha_{k,t-1})>0,
+\]
+because for a random walk $\Cov(\alpha_{t-1},\alpha_t)=\Var(\alpha_{t-1})$. Hence
+\[
+\plim\hat\beta=\beta-\frac{\psi\Var(\tilde\alpha)}{\Var(\tilde x^{\rm exo})+\psi^2\Var(\tilde\alpha)}<\beta .
+\]
+Under the minus-$\beta$ convention, $\Cov(x,e)>0$ pushes the estimated coefficient on $x$ up toward zero, so
+$\hat\beta$ is biased \emph{toward zero}. It can even turn negative when drift dominates the clean
+variation, since the limit tends to $\beta-1/\psi$. \emph{Persistence is essential.} If $\alpha$ were AR(1) with coefficient
+$\varrho$, the covariance would be $\psi\varrho\Var(\alpha)$, which vanishes for transitory ($\varrho=0$) shocks: a
+cut made in response to last period's noise is uncorrelated with this period's. For a random walk,
+$\Var(\tilde\alpha)$ grows with $n$ (roughly $\sigma_\eta^2n/6$ after demeaning), so the bias does not shrink
+with more data. This is why $\beta^{FE}$ is a cross-check rather than evidence, and why the main estimate with competitor data is
+$\beta^{\rm hier}$, which models the drift (\S\ref{sec:bayes-contrast}). Event studies are not immune either: a move
+timed on a recent dip biases $\hat\beta_e$ the same way (\S\ref{sec:usable}).
+
+\subsection{Why HC1 under-covers}
+For one slope, $\hat\beta-\beta=-\big(\sum\tilde x^2\big)^{-1}\sum_t\tilde x_t\tilde e_t$. HC1 estimates
+$\Var(\sum\tilde x_t\tilde e_t)$ by $\frac{N}{N-p}\sum\tilde x_t^2\hat e_t^2$, which assumes the
+cross-products are uncorrelated over $t$. If $\tilde x$ and $\tilde e$ are independent AR(1) processes with coefficients
+$\varrho_x,\varrho_e$, then
+\[
+\Var\Big(\sum_t\tilde x_t\tilde e_t\Big)\approx n\sigma_x^2\sigma_e^2\Big(1+2\sum_{h\ge1}\varrho_x^h\varrho_e^h\Big)
+=n\sigma_x^2\sigma_e^2\,\frac{1+\varrho_x\varrho_e}{1-\varrho_x\varrho_e}.
+\]
+A lagged cumulative price is very persistent. With $\varrho_x=0.9$ and $\varrho_e=0.8$ the factor is $6.1$, so the true SE
+is about $2.5\times$ HC1. With a random-walk error there is no finite factor (the spurious-regression
+case). Clustering by segment would fix this asymptotically, but with $K\approx6$ clusters cluster-robust SEs
+are themselves badly biased, so the code keeps HC1 and the README calls it a lower bound.
+
+\subsection{Choosing $\kappa$ and the half-lives}
+\code{fe.grid_search} refits \eqref{eq:twfe} for every $(\kappa,h_H,h_D)$ in
+$\{0.3,0.5,0.7\}\times\{1,2,4\}\times\{4,8,16\}$ and records the SSR. Let $G=\mathrm{SSR}_{\rm prior}/\mathrm{SSR}_{\rm best}-1$.
+The prior combination $(0.5,2,8)$ is on the grid, so $G\ge0$. The winner is used only if $G\ge$ \code{grid_min_gain}
+$=0.10$. Otherwise the priors are kept.
+
+\emph{Why not a likelihood-ratio test?} Under iid Gaussian errors the concentrated log-likelihood is
+$-\tfrac N2\log(\mathrm{SSR}/N)$, so $\mathrm{LR}=N\log(1+G)$. With $N=6\times104=624$, $G=0.10$ gives
+$\mathrm{LR}\approx59$, and even $G=1.3\%$ exceeds the $\chi^2_3$ 5\% critical value of $7.8$. That would
+almost always reject the priors. But the $\chi^2$ limit needs independent errors. With serial
+correlation the effective sample size is closer to $N(1-\varrho)/(1+\varrho)$ for AR(1) residuals, and with
+random-walk drift the SSR surface mostly reflects how well each $x$ happens to track the drift. Also,
+$(\kappa,h_H,h_D)$ are not identified when $\beta=0$ (a Davies-type problem), and the search is over a
+coarse discrete grid. So the 10\% rule is a judgment threshold: the data must prefer an alternative
+clearly before it overrides the priors. The chosen combination is then treated as known in all later
+SEs, which is a mild pre-test effect.
+
+\takeaway{The panel regression compares segments with each other week by week, so anything that
+hit all segments at once (RBA moves, seasonality, bank-wide repricing) cancels out. That makes it
+robust to market noise. But it also learns from price cuts we made \emph{because} volume was weak, which
+makes it understate sensitivity, and its error bars are too narrow. We use it as a cross-check only.}
+
+%=====================================================================
+\section{Event studies}\label{sec:events}
+
+\subsection{Estimator}
+For an event in segment $k$, \code{events.event_study} snaps the event date to the first period end on
+or after it (\code{searchsorted}, left), giving index $i$. Rates are day-weighted, so a mid-period move
+appears partly in period $i$. The windows are $W^-=\{i-n_{\rm pre},\dots,i-1\}$ and
+$W^+=\{i,\dots,i+n_{\rm post}-1\}$, with defaults $4$ and $8$. For any series $z_j$, \code{events._change} computes
+$\Delta z_j=\overline{z_j}^{\,W^+}-\overline{z_j}^{\,W^-}$. The controls $C$ are segments with no logged event
+(usable or not) in $W^-\cup W^+$, and $n_c=|C|$. Then
+\[
+dy=\Delta y_k-\tfrac1{n_c}\sum_{c\in C}\Delta y_c,\quad \Delta x_C=\tfrac1{n_c}\sum_{c\in C}\Delta x_c,\quad
+dx=\Delta x_k-\Delta x_C,\quad \hat\beta_e=-dy/dx .
+\]
+\emph{Dropped events} (counted and printed): \code{after_end} (dated after the last period),
+\code{window_edge} (a window extends beyond the panel), \code{no_controls} (every other segment has an
+event in the window), \code{small_dx} ($|dx|<$ \code{min_dx_bps} $=1$), and \code{non_finite}. Other events of
+our own in the same segment and window are reported (\code{own_events_in_window}) but not dropped.
+
+\subsection{When is $\hat\beta_e$ unbiased?}
+Use the model $y_{jt}=\alpha_{jt}+\delta_t-\beta_jx_{jt}+\varepsilon_{jt}$. Differencing removes $\delta_t$:
+\[
+dy=(\Delta\alpha_k-\Delta\alpha_C)-\beta_k\Delta x_k+\tfrac1{n_c}\textstyle\sum_c\beta_c\Delta x_c+(\Delta\varepsilon_k-\Delta\varepsilon_C).
+\]
+Write $\beta_C:=\sum_c\beta_c\Delta x_c/\sum_c\Delta x_c$ (the controls' $\beta$ weighted by their $\Delta x$).
+Using $\beta_k\Delta x_k-\beta_C\Delta x_C=\beta_k\,dx+(\beta_k-\beta_C)\Delta x_C$,
+\begin{equation}\label{eq:esdecomp}
+\hat\beta_e=\beta_k+(\beta_k-\beta_C)\frac{\Delta x_C}{dx}-\frac{\Delta\alpha_k-\Delta\alpha_C}{dx}-\frac{\Delta\varepsilon_k-\Delta\varepsilon_C}{dx}.
+\end{equation}
+Our prices and $\rs$ are recorded rather than random, so $dx$ is fixed given the data and $\hat\beta_e$ is \emph{linear} in
+$dy$. Hence $\E[\hat\beta_e]=\beta_k$ exactly when:
+\begin{enumerate}
+\item[(A1)] \emph{Parallel trends}: $\E[\Delta\alpha_k-\Delta\alpha_C\mid\text{event}]=0$. The timing was not chosen
+in response to the segment's own share drift. Mixed-motive moves can break this (\S\ref{sec:usable}).
+\item[(A2)] \emph{Homogeneity or quiet controls}: $\beta_C=\beta_k$, or $\Delta x_C=0$.
+\item[(A3)] \emph{Correct timing}: $x$ (with $\kappa$, $h_H$, $h_D$) describes how the response unfolds, and there is no
+anticipation inside $W^-$. Incomplete adjustment within $W^+$ is \emph{not} a bias, because $dx$ uses the same
+lagged path. It only reduces $|dx|$ and precision. With $n_{\rm post}=8$ the headline is
+$1-2^{-8/2}\approx94\%$ perceived, and the discretionary change only $50\%$.
+\item[(A4)] \emph{No spillovers}: our price in $k$ does not move $y_c$, for example through borrowers switching
+LVR band or repayment type. A spillover raises control share when we get dearer and biases $\hat\beta_e$ upward.
+\item[(A5)] $dx$ is measured correctly (\S\ref{sec:x}), and any other own events in the window are themselves usable.
+\end{enumerate}
+
+\subsection{Heterogeneity term}
+The second term of \eqref{eq:esdecomp} is the bias when the controls' $x$ also moved, from competitor
+moves, an earlier event's lag tail, or demeaning. The code treats $\beta_k-\beta_C$ as an unknown
+with mean $0$ and sd $\sigma_{\rm het}$, and adds its contribution in quadrature:
+\[
+\mathrm{se}_e=\operatorname{hypot}\!\Big(\frac{\mathrm{se}_{dy}}{|dx|},\;\sigma_{\rm het}\frac{|\Delta x_C|}{|dx|}\Big),\qquad
+\sigma_{\rm het}=f\,\beta_{0k},
+\]
+since \code{cli.cmd_estimate} passes \code{prior_sd_frac * beta0} as \code{beta_sd}.
+\emph{Approximation.} $\sigma_{\rm het}$ is the prior sd of $\beta_k$ itself. It is not the sd of the difference
+$\beta_k-\beta_C$. Under the pooling model of \S\ref{sec:pool},
+$\beta_k-\beta_c=\lambda(\beta_{0k}-\beta_{0c})+\beta_{0k}\zeta_k-\beta_{0c}\zeta_c$. When baseline shares are
+similar ($\beta_{0k}\approx\beta_{0c}=\beta_0$), $\lambda$ cancels and
+$\mathrm{sd}(\beta_k-\beta_C)\approx\tau\beta_0\sqrt{1+1/n_c}\approx0.16\beta_0$, so the code is about $2\times$
+conservative. When baseline shares differ, $\beta_0=u/(1-s_0)$ differs too. Then the difference has a non-zero
+prior mean $\beta_{0k}-\beta_{0c}$ and an extra sd of $\sigma_\lambda|\beta_{0k}-\beta_{0c}|\approx0.26\,|\beta_{0k}-\beta_{0c}|$,
+so the code can be anti-conservative, for example for a high-$s_0$ segment against low-$s_0$ controls.
+Under independent priors the sd would be about $f\beta_0\sqrt{1+1/n_c}$, slightly more than the code uses.
+The term is also systematic: repeated events in one segment with the same controls share it, yet
+\S\ref{sec:prior} treats events as independent. \emph{Move path:} demeaning gives controls
+$\Delta x_c=-\Delta/K$ even when no control repriced. The demeaning itself cancels from $dx$, since
+$dx=\Delta(1-\tfrac1K)+\tfrac{\Delta}{K}=\Delta$, but it still triggers a heterogeneity term of
+$\sigma_{\rm het}/K$. That makes the SE slightly conservative.
+
+\subsection{Noise in $dy$}
+\paragraph{iid benchmark.} If $\varepsilon_{jt}$ is iid $(0,\sigma^2)$ and $\alpha$ is constant over the window,
+$\Var(\Delta\varepsilon_j)=\sigma^2(1/n_{\rm pre}+1/n_{\rm post})$. Averaging $n_c$ independent controls gives
+\begin{equation}\label{eq:iidvar}
+\Var(dy)=\sigma^2\Big(\frac1{n_{\rm pre}}+\frac1{n_{\rm post}}\Big)\Big(1+\frac1{n_c}\Big).
+\end{equation}
+\paragraph{Drift is not negligible.} Let $\alpha$ be a random walk with innovation sd $\sigma_\eta$. Then the post mean
+minus $\alpha_{i-1}$ is $\sum_{s=0}^{Q-1}\frac{Q-s}{Q}\eta_{i+s}$ (with $Q=n_{\rm post}$), and $\alpha_{i-1}$ minus the
+pre mean is $\sum_{m=1}^{P-1}\frac{P-m}{P}\eta_{i-m}$ (with $P=n_{\rm pre}$). The innovations are independent, so
+\[
+\Var(\Delta\alpha)=\sigma_\eta^2\Big[\frac{(Q+1)(2Q+1)}{6Q}+\frac{(P-1)(2P-1)}{6P}\Big]=4.06\,\sigma_\eta^2
+\quad(P=4,Q=8),
+\]
+compared with $0.375\,\sigma^2$ from \eqref{eq:iidvar}. With $\sigma=0.05$ and $\sigma_\eta=0.01$, drift adds about
+$43\%$ to the variance. Period-level noise alone understates the uncertainty.
+
+\paragraph{Placebo windows} (\code{events._placebo_sd}). For every window start and every segment $j$ with
+no own event in the window and placebo $|dx|<$ \code{min_dx}, the code computes the same DiD $dy$
+against all $K-1$ other segments. It then sets $\hat\sigma_{dy}=1.4826\cdot\mathrm{MAD}$. \emph{Why $1.4826$:} for
+$Z\sim N(\mu,\sigma^2)$, $\mathrm{median}|Z-\mu|=\sigma\Phi^{-1}(3/4)=0.6745\sigma$, so
+$\sigma=\mathrm{MAD}/0.6745=1.4826\,\mathrm{MAD}$. The MAD has a 50\% breakdown point, so unlogged moves or
+outliers do not inflate it. \emph{Why placebos capture autocorrelation and drift:} a placebo $dy$ is the
+same function of the same data, evaluated where nothing happened. Its spread is the null
+distribution of the statistic, including the $\Var(\Delta\alpha)$ term above and any serial correlation
+in $\varepsilon$, without having to model either. Caveats: windows overlap, so the placebos are
+strongly dependent and the count overstates their information. Placebos are pooled over segments,
+which ignores the segment heteroskedasticity of \eqref{eq:sampling}. Placebo $dy$ is not adjusted for
+the up-to-$1$\,bp $dx$ allowed, so a price effect of up to $\beta\cdot1$\,bp can leak in, which is conservative.
+
+\paragraph{Rescaling to the event's controls.} Under \eqref{eq:iidvar} the placebo variance carries
+$(1+\frac1{K-1})$ and the event's carries $(1+\frac1{n_c})$, so
+$\mathrm{se}_{dy}=\hat\sigma_{dy}\sqrt{1+1/n_c}\,/\sqrt{1+1/(K-1)}$. This is exact for independent segment noise.
+
+\paragraph{Fallback.} With fewer than 10 placebo windows the code uses
+$\hat\sigma=\mathrm{sd}(\Delta_t y)/\sqrt2$ (for iid noise $\Var(\Delta_t\varepsilon)=2\sigma^2$) in \eqref{eq:iidvar}, with
+$n_c=K-1$, and then rescales the same way. It ignores drift and includes common shocks
+and price moves in $\Delta_t y$, so it is rough in both directions.
+
+\subsection{Standard error of a ratio}
+For $\hat\beta=g(dy,dx)=-dy/dx$, the delta method gives
+$\Var(\hat\beta)\approx\frac{\Var(dy)}{dx^2}+\frac{dy^2\Var(dx)}{dx^4}-\frac{2\,dy\Cov(dy,dx)}{dx^3}$. The code
+sets $\Var(dx)=0$, which leaves $\mathrm{se}_{dy}/|dx|$, exact for fixed $dx$. Uncertainty in $dx$ is ignored,
+from the choice of $\kappa$ and $h$ and from unseen competitor discounts. Its effect is
+$\delta\hat\beta/\hat\beta\approx-\delta(dx)/dx$, so a $0.3$\,bp error is negligible for a $10$\,bp move but $30\%$ at
+the $1$\,bp floor. When $dx$ is uncertain and small relative to its own error, the ratio is far from
+normal (the Fieller problem). The floor \code{min_dx_bps} is therefore a low bar.
+
+\subsection{Which events may update $\beta$}\label{sec:usable}
+Every price move mixes strategy, volume, competitor reaction and cost. Motive cannot be classified, so the input flag
+cannot carry the identifying assumption (A1). The pipeline therefore only removes what can be recorded:
+\code{clean} $=$ (\code{other_changes}$=\varnothing$) $\wedge$ \code{flagged_clean}. A campaign, broker incentive or
+policy change launched with the price move shifts share at the same time as the price, so it is visible only if logged.
+\code{flagged_clean} (default true) is a veto.
+
+\paragraph{Why there is no data screen.} Let $\mathcal F_{i-1}$ be the history up to $i-1$ and suppose the decision depends
+on the data only through $\mathcal F_{i-1}$. Split the share-drift term in \eqref{eq:esdecomp},
+\[
+\Delta\alpha_k=\underbrace{\big(\overline{\alpha_k}^{\,W^+}-\alpha_{k,i-1}\big)}_{\text{future}}+
+\underbrace{\big(\alpha_{k,i-1}-\overline{\alpha_k}^{\,W^-}\big)}_{S_k:\ \mathcal F_{i-1}\text{-measurable}}.
+\]
+For a martingale $\alpha$ the first part has mean zero however the event was timed, so the bias is
+$-\E[S_k-S_C\mid\text{event}]/dx$: non-zero exactly when the decision selected on a recent dip. A natural screen is the
+same DiD on a fake event at $i-n$, $T=\overline\alpha^{W^-}-\overline\alpha^{W^{--}}$. For a random walk with
+innovations $\eta$ and $n=4$, $\Cov(S,T)=\tfrac{10}{16}\sigma_\eta^2$, $\Var(S)=\tfrac{14}{16}\sigma_\eta^2$ and
+$\Var(T)=\tfrac{44}{16}\sigma_\eta^2$, so $\mathrm{corr}(S,T)=0.40$ before adding noise. A selection rule that shifts
+$\E[S]$ by $\gamma$ moves $\E[T]$ by only about $0.23\gamma$. Such a screen was built and tested. In the reactive simulation it
+failed $4$--$5\%$ of reactive cuts against $3\%$ of random ones, and it cost every event in the first $2n$ periods,
+so it was removed. The better protection against this channel is the drifting level in $\beta^{\rm hier}$
+(\S\ref{sec:bayes-contrast}), which conditions on $\alpha_{k,i-1}$ directly.
+
+\takeaway{For each deliberate repricing we compare how our share in that segment moved, before
+versus after, with segments we did not touch. The share change divided by the price change is a
+direct reading of sensitivity. Its error bar comes from running the same comparison at quiet times,
+so it reflects how noisy share really is. An event only updates the answer if nothing else was logged as changed at the same
+time and you have not vetoed it. We do not ask why a move was made, because almost every move is partly strategy, partly
+volume and partly competitors, so moves made after share slipped stay in and make price look a little less effective.}
+
+%=====================================================================
+\section{Prior and per-segment posterior}\label{sec:prior}
+
+\subsection{Calibrating the prior from the business uplift}
+In the binary logit $s=\Lambda(\alpha-\beta x)$, $\frac{ds}{dx}=-\beta s(1-s)$, hence
+\[
+\frac{d\ln s}{dx}=-\beta(1-s).
+\]
+With applications $A=c\,s\,M$ ($c$, $M$ fixed), $d\ln A/dx$ is the same. So ``applications rise by a
+fraction $u$ per bp of price cut, at baseline'' means $u=\beta(1-s_0)$ (\code{model.u_from_beta}), i.e.\
+\[
+\beta_{0k}=\frac{u}{1-s_{0k}}\qquad(\code{model.beta_from_uplift}).
+\]
+$\beta$ is a constant of the logit, while $u$ is the marginal semi-elasticity, which depends on the share.
+For small shares $\beta\approx u$. The baseline share is lodgement-weighted over the trailing
+\code{s0_window} $=13$ periods, $s_{0k}=\sum L_{kt}/\sum M_{kt}$ (\code{panel.baseline_share}). The prior is
+$\beta_k\sim N\big(\beta_{0k},(f\beta_{0k})^2\big)$ with $f=$ \code{prior_sd_frac} $=0.30$, a governance judgment.
+
+\subsection{Conjugate update}
+Treat usable events (\S\ref{sec:usable}) as $\hat\beta_e\mid\beta_k\sim N(\beta_k,\mathrm{se}_e^2)$, independent. Completing the square
+in $\beta_k$ in $-\frac{(\beta_k-\beta_{0k})^2}{2\sigma_0^2}-\sum_e\frac{(\hat\beta_e-\beta_k)^2}{2\mathrm{se}_e^2}$, with $\sigma_0=f\beta_{0k}$,
+gives a normal posterior (\code{pool.posterior_betas}):
+\[
+\Pi=\frac1{\sigma_0^2}+\sum_e\frac1{\mathrm{se}_e^2},\qquad
+\E[\beta_k\mid\text{data}]=\frac{\beta_{0k}/\sigma_0^2+\sum_e\hat\beta_e/\mathrm{se}_e^2}{\Pi},\qquad
+\mathrm{sd}=\Pi^{-1/2}.
+\]
+Let $\pi_k=(1/\sigma_0^2)/\Pi$ (\code{prior_weight}). Then
+$\E[\beta_k\mid\cdot]=\pi_k\beta_{0k}+(1-\pi_k)\bar\beta_k^{\rm ev}$, where $\bar\beta_k^{\rm ev}$ is the precision-weighted
+event mean, and $\Var=\pi_k\sigma_0^2$. So \code{prior_weight} is both the share of the answer that is still judgment and
+the factor by which the prior variance has shrunk. The 90\% interval is $\pm1.645\,$sd.
+
+\subsection{Why $\beta^{FE}$ is not added as evidence}
+(i) \emph{Double counting:} the event windows are part of the panel, so treating $\beta^{FE}$ as independent
+evidence uses the same observations twice. (ii) \emph{Bias:} $\beta^{FE}$ is pulled toward zero by reactive repricing
+(\S\ref{sec:fe}). (iii) \emph{Over-confidence:} its HC1 SE is too small. Precision weighting gives the most
+weight to the most over-confident input, so $\beta^{FE}$ would dominate the posterior with a biased
+value. It is reported alongside as a cross-check.
+
+\emph{Approximation:} events in one segment with overlapping windows share noise and the
+heterogeneity term, so treating them as independent overstates the posterior precision somewhat.
+
+\takeaway{We start from the business's current rule of thumb ($u=8\%$ more applications per bp) and
+let each segment's usable repricings pull the answer away from it. A segment with few or noisy events
+stays close to the rule of thumb, and \code{prior_weight} shows how close.}
+
+%=====================================================================
+\section{Pooling across segments}\label{sec:pool}
+
+\subsection{Model}
+\code{pool.pooled_betas} works on ratios to the prior, $\rho_k=\beta_k/\beta_{0k}$:
+\[
+\rho_k=\lambda+\zeta_k,\qquad \lambda\sim N(1,\sigma_\lambda^2),\qquad \zeta_k\overset{iid}{\sim}N(0,\tau^2),\qquad
+\sigma_\lambda^2=f^2-\tau^2,
+\]
+with $\tau=$ \code{segment_sd_frac} $=0.15$, and $0<\tau<f$ is enforced by \code{cli.cmd_estimate}. $\lambda$ is a
+multiplicative error in $u$ common to all segments. $\zeta_k$ is the segment's own departure.
+\emph{Each segment's prior equals the unpooled one}: marginally
+$\rho_k\sim N(1,\sigma_\lambda^2+\tau^2)=N(1,f^2)$, i.e.\ $\beta_k\sim N(\beta_{0k},(f\beta_{0k})^2)$. What pooling adds is the
+prior correlation $\mathrm{corr}(\rho_k,\rho_j)=\sigma_\lambda^2/f^2=0.75$.
+
+\subsection{Segment summaries}
+Each event gives $r_e=\hat\beta_e/\beta_{0k}$ with variance $(\mathrm{se}_e/\beta_{0k})^2$. Precision-weighting within a segment gives
+\[
+\hat\rho_k=\frac{\sum_e r_e(\beta_{0k}/\mathrm{se}_e)^2}{\sum_e(\beta_{0k}/\mathrm{se}_e)^2},\qquad
+v_k=\Big[\sum_e(\beta_{0k}/\mathrm{se}_e)^2\Big]^{-1},
+\]
+a sufficient statistic: $\hat\rho_k\mid\rho_k\sim N(\rho_k,v_k)$. Segments without events have $v_k=\infty$.
+Integrating out $\zeta_k$,
+\[
+\hat\rho_k\mid\lambda\sim N(\lambda,\tau^2+v_k),\quad\text{independent across $k$ given $\lambda$.}
+\]
+
+\subsection{Posterior of the shared scale}
+This is a normal--normal update with one observation per segment:
+\[
+P_\lambda=\frac1{\sigma_\lambda^2}+\sum_{k:v_k<\infty}\frac1{\tau^2+v_k},\qquad
+\hat\lambda=\E[\lambda\mid D]=\frac{1/\sigma_\lambda^2+\sum_k\hat\rho_k/(\tau^2+v_k)}{P_\lambda},\qquad
+\Var(\lambda\mid D)=P_\lambda^{-1}.
+\]
+These are \code{shared_scale} and \code{shared_scale_sd}. Note that $\tau^2$ caps every segment's
+influence: a segment with very precise events counts as one observation with variance $\tau^2$, not $v_k$.
+
+\subsection{Exact posterior of $\rho_k$}
+\begin{proposition}\label{prop:pool}
+With $\omega_k=\tau^2/(\tau^2+v_k)$ ($\omega_k=0$ if $v_k=\infty$),
+\[
+\E[\rho_k\mid D]=\omega_k\hat\rho_k+(1-\omega_k)\hat\lambda,\qquad
+\Var(\rho_k\mid D)=\frac{\tau^2v_k}{\tau^2+v_k}+(1-\omega_k)^2\,\Var(\lambda\mid D),
+\]
+and the posterior is normal. For $v_k=\infty$ the first variance term is $\tau^2$.
+\end{proposition}
+\begin{proof}
+\emph{Conditional step.} Given $\lambda$, the pairs $(\rho_j,\hat\rho_j)$ are independent across $j$, so
+$\rho_k\mid\lambda,D\overset{d}{=}\rho_k\mid\lambda,\hat\rho_k$. With prior $\rho_k\mid\lambda\sim N(\lambda,\tau^2)$ and
+likelihood $N(\rho_k,v_k)$, the posterior has precision $1/\tau^2+1/v_k$ and mean
+$\frac{v_k\lambda+\tau^2\hat\rho_k}{\tau^2+v_k}=\omega_k\hat\rho_k+(1-\omega_k)\lambda$, with variance $\frac{\tau^2v_k}{\tau^2+v_k}$.
+\emph{Integrating $\lambda$.} By the law of total expectation,
+$\E[\rho_k\mid D]=\E\big[\E[\rho_k\mid\lambda,D]\mid D\big]=\omega_k\hat\rho_k+(1-\omega_k)\hat\lambda$. By the law of
+total variance, $\Var(\rho_k\mid D)=\E[\Var(\rho_k\mid\lambda,D)\mid D]+\Var(\E[\rho_k\mid\lambda,D]\mid D)
+=\frac{\tau^2v_k}{\tau^2+v_k}+(1-\omega_k)^2\Var(\lambda\mid D)$. The conditional variance does not depend on
+$\lambda$, and the conditional mean is affine in a normal $\lambda$, so the mixture is exactly normal.
+\end{proof}
+There is no double counting. $\hat\rho_k$ enters $\hat\lambda$, but averaging over $\lambda\mid D$ is exactly what the
+tower property requires. The code reports $\beta^{\rm pool}_k=\beta_{0k}\E[\rho_k\mid D]$ and
+$\mathrm{sd}=\beta_{0k}\mathrm{sd}(\rho_k\mid D)$. These match brute-force joint-Gaussian conditioning, which was checked numerically while this document was written. With no events at all,
+$\hat\lambda=1$ and $\Var=\tau^2+\sigma_\lambda^2=f^2$, which is exactly the prior.
+
+\paragraph{Interpreting the outputs.} \code{shared_scale} $=\hat\lambda$ says by how much $u$ is off across the
+board. \code{own_weight} $=\omega_k$ is the weight on the segment's own events \emph{given} $\lambda$. The total
+sensitivity of the posterior mean to $\hat\rho_k$ is larger,
+$\omega_k+(1-\omega_k)\big/\big((\tau^2+v_k)P_\lambda\big)$, because $\hat\rho_k$ also moves $\hat\lambda$.
+
+\paragraph{Limits.} As $\tau\to f$, $\sigma_\lambda^2\to0$ and $\lambda\equiv1$. Each segment then has an independent
+$N(1,f^2)$ prior, and the posterior equals \code{posterior_betas}, since in ratio units the precision is
+$1/f^2+1/v_k$. As $\tau\to0$, $\omega_k\to0$ and all segments share $\hat\lambda$ (complete pooling).
+So $\tau$ interpolates between \code{beta_post} and one common scale.
+
+\subsection{When pooling helps, and when it hurts}
+For a segment with no events, \code{beta_post} $=\beta_{0k}$, with error $\beta_{0k}(\rho_k-1)$, while
+\code{beta_pool} $=\beta_{0k}\hat\lambda$. If the business $u$ is wrong for everyone ($\lambda\ne1$), events
+anywhere move $\hat\lambda$ toward the truth and fix segments that have no data of their own. If instead
+$\lambda\approx1$ but the true $\zeta_k$ exceed $\tau$, pooling shrinks a genuinely different segment toward
+$\hat\lambda$ with weight $1-\omega_k$, a bias of $(1-\omega_k)\beta_{0k}(\rho_k-\hat\lambda)$ that is larger than the
+unpooled shrinkage to $1$ allows for. The README's simulation (0--1 usable events per segment, 20 seeds)
+shows both effects. With $u$ about 50\% too high, relative RMSE was 75\% for the prior, 61\% for
+\code{beta_post} and 38\% for \code{beta_pool}. With $u$ right on average but segments differing by
+$\pm30$--$50\%$, RMSE was 28\% for \code{beta_post} and 30--33\% for \code{beta_pool}.
+
+\paragraph{Reading the outputs (README, ``Which beta to use'').} \code{beta_post} and \code{beta_pool} are the $u=8\%$ judgment
+updated by a few usable events, not the main estimate. \code{shared_scale} tests the judgment: if the 90\% interval
+$\hat\lambda\pm1.645\,$\code{shared_scale_sd} excludes $1$, the assumption is off across the board and \code{beta_pool} is the
+better of the two. Otherwise \code{beta_post} is. \code{segment_sd_frac} is a judgment about how different segments can be.
+Raise it (e.g.\ to $0.25$) if segments plausibly differ a lot, such as fixed versus variable.
+
+\subsection{Contrast with the PyMC panel model}\label{sec:bayes-contrast}
+\code{bayes.fit_hierarchical} (optional, \code{--bayes}) is the main estimate when competitor data is available
+($\hat\beta^{FE}$ is the cross-check). It fits
+\[
+y_{kt}\sim N\big(\alpha_k+w_{kt}+\delta_t-\beta_kx_{kt},\sigma^2\big),\qquad
+w_{kt}=q\sum_{s\le t}\varepsilon_{ks},\quad \textstyle\sum_k\varepsilon_{ks}=0,
+\]
+with $\beta_k\sim N(\mu_b,\tau_b^2)$, $\mu_b\sim N(\bar\beta_0,(f\bar\beta_0)^2)$ where $\bar\beta_0=u/(1-\bar s_0)$,
+$\tau_b\sim$ HalfNormal$(0.5\bar\beta_0)$, $q\sim$ HalfNormal$(0.05)$, and sum-to-zero $\delta_t$. Here $w_{kt}$ is a random walk
+in each segment's level, the same local-level assumption as \S\ref{sec:alpha}. Its innovations sum to zero across
+segments, so common drift stays in $\delta_t$ and the two are identified. The drift term is what makes the
+intervals honest. With a fixed $\alpha_k$, slow drift in share is absorbed as if it were noise-free signal, and in
+simulation the 90\% intervals covered the true $\beta$ about 17\% of the time. With $w_{kt}$, on the gap path with $T$
+re-solved at $1/\hat\beta^{FE}$, they covered it in 22 of 24 segment-runs (4 simulations), and 19 of 24 when price was
+also cut whenever share fell. In that reactive case the sampler warning fired in every run, with $\hat R\le1.02$ and
+good estimates, so a mild warning calls for a comparison with $\hat\beta^{FE}$, not rejection. The model reports $\hat R$, bulk ESS and
+divergences, and warns when sampling looks unreliable. In simulation that warning fired when the move model was fitted to
+data with competitor moves it cannot see: a misspecified model, correctly flagged.
+
+The model pools on $\beta$ levels toward one mean and learns $\tau_b$ from the data. Its likelihood is the whole
+panel, so it never sees the event log or the \code{clean} (usable) flag. It does not inherit $\beta^{FE}$'s bias from
+moves made because share had fallen. If the decision at $t$ depends on $y_{k,t-1}$ and the shortfall persists, the
+shortfall is in $w_{k,t-1}$, and the move is measured against the drifted level rather than against $\alpha_k$. In
+simulation with price cut whenever share fell, $\hat\beta^{\mathrm{hier}}$ averaged $1.02\times$ truth (0.85--1.14 per run)
+on the move path while $\hat\beta^{FE}$ was about $0.5\times$ in 3 of 4 runs. On the gap path it was 0.95--1.12 against
+0.77--1.11 for $\hat\beta^{FE}$. Moves made on information not yet in share (pipeline, broker
+intelligence) are not covered by this argument.
+\code{pooled_betas} pools ratios, uses only usable events, fixes $\tau$ by judgment, and is closed form.
+
+\takeaway{If the business rule of thumb is wrong, it is probably wrong by a similar factor in every
+segment. Pooling lets usable repricings anywhere correct that factor everywhere, including segments
+we have never repriced. It is the better choice when the evidence says the rule of thumb is
+clearly off, and the per-segment answer is better when segments genuinely differ.}
+
+%=====================================================================
+\section{Natural share}\label{sec:alpha}
+
+\code{alpha.track_alpha} holds $\beta_k$ at \code{beta_post} (\code{cli.cmd_estimate}) and inverts
+\[
+\hat\alpha_{kt}=y_{kt}+\beta_kx_{kt}\;(=\alpha_{kt}+\delta_t+\varepsilon_{kt}\text{ under the model}),
+\]
+then treats it as a local-level model:
+\[
+\hat\alpha_t=a_t+\nu_t,\ \nu_t\sim N(0,\sigma_\nu^2);\qquad a_t=a_{t-1}+\eta_t,\ \eta_t\sim N(0,\sigma_\eta^2).
+\]
+\paragraph{Kalman filter.} With predicted variance $P_{t|t-1}=P_{t-1}+\sigma_\eta^2$ and gain
+$K_t=P_{t|t-1}/(P_{t|t-1}+\sigma_\nu^2)$:
+$m_t=m_{t-1}+K_t(\hat\alpha_t-m_{t-1})$ and $P_t=(1-K_t)P_{t|t-1}$. In steady state $P_{t|t-1}\to P$ with
+$P=P\sigma_\nu^2/(P+\sigma_\nu^2)+\sigma_\eta^2$, i.e.\ $P^2-\sigma_\eta^2P-\sigma_\eta^2\sigma_\nu^2=0$, so
+$P=\tfrac12\big(\sigma_\eta^2+\sqrt{\sigma_\eta^4+4\sigma_\eta^2\sigma_\nu^2}\big)$. The filter is then an exponentially
+weighted average with weight $K=P/(P+\sigma_\nu^2)$, which depends only on $\sigma_\eta^2/\sigma_\nu^2$. The smoother
+(Rauch--Tung--Striebel) adds a backward pass, so each estimate also uses later data.
+
+\paragraph{Two paths.} With $n\ge$ \code{min_periods_alpha_mle} $=24$, the code fits $\sigma_\nu^2,\sigma_\eta^2$ by maximum likelihood
+through the prediction-error decomposition (\code{UnobservedComponents}) and returns the \emph{smoothed} level.
+With shorter series, \code{alpha._filter_fixed_ratio} fixes the ratio $q/r=\sigma_\eta^2/\sigma_\nu^2=0.1$, because
+short-sample MLE of a variance ratio is unreliable and often piles up at zero. It returns the
+\emph{filtered} level. With ratio $0.1$, $K\approx0.27$, an exponentially weighted average with a half-life of about $2.2$ periods. It
+estimates $\sigma_\nu^2$ as $\Var(\Delta\hat\alpha)/2$. Since $\Var(\Delta\hat\alpha)=\sigma_\eta^2+2\sigma_\nu^2$, this is
+$\sigma_\nu^2(1+\tfrac{q/r}{2})$, about 5\% high, which is harmless. The two paths therefore differ in kind: two-sided
+versus one-sided. The README describes both as ``filtered''.
+
+\paragraph{Meaning.} \code{natural_share} $=\Lambda(a_t)$ is the share we would have had at $x=0$, i.e.\
+with our price relative to the market as at the panel start, or demeaned in the move model. It
+\emph{includes} $\delta_t$: genuine market-wide demand shifts, seasonality, brand-wide effects and anything
+demeaning removed. It is not a pure franchise measure. If $\beta$ is wrong, residual price
+effects leak into it. $\beta$ is not re-estimated here: a free $\beta$ and a free random-walk level are
+nearly unidentified together, because drift can absorb any price response.
+
+\takeaway{Natural share is what our share would have been with no change in our relative price. It
+moves with market conditions and our brand as well as with things we did, so it shows the trend
+underneath pricing.}
+
+%=====================================================================
+\section{The Excel forward model}\label{sec:excel}
+
+\subsection{The multiplier}
+Hold the market total $M$ and conversion $c$ fixed. With $s(x)=\Lambda(a-\beta x)$ and
+$s_0=s(0)=\Lambda(a)$, we have $e^{-a}=(1-s_0)/s_0$, so
+\[
+\frac{A(x)}{A_0}=\frac{s(x)}{s_0}=\frac{1+e^{-a}}{1+e^{-a}e^{\beta x}}
+=\frac{1/s_0}{\big(s_0+(1-s_0)e^{\beta x}\big)/s_0}
+=\boxed{\frac{1}{s_0+(1-s_0)e^{\beta x}}}
+\]
+(\code{model.multiplier}).
+Properties: $m(0)=1$, $m'(0)=-\beta(1-s_0)=-u$ (consistent with \S\ref{sec:prior}), and
+$m''(0)=\beta^2(1-s_0)(1-2s_0)$. So for $s_0<\tfrac12$ the curve is convex: a cut helps by more than an equal rise hurts. As
+$x\to-\infty$, $m\to1/s_0$ (we would take the whole market). As $x\to+\infty$, $m\to0$.
+
+\subsection{Assumptions}
+(i) Our price does not change the market total, since there is no outside good (\S\ref{sec:choice}).
+(ii) Conversion is constant (\code{panel.conversion_report}). (iii) $s_0$ is the share \emph{at today's $x$}, and the Excel
+$x$ is a change from today. (iv) The multiplier is the steady state. The model's path after a step $\Delta$ is
+$m\big(\Delta(1-(1-\phi_{h_H})^{\tau})\big)$, $\tau$ periods in, and Excel applies the full effect. (v) Competitors and
+other segments do not respond. (vi) A move in the discretionary discount enters $x$ as $\kappa$ times its size.
+
+\paragraph{\code{x_drift_s0_window}.} $s_0$ pools the trailing 13 periods. If $x$ moved within them,
+$s_0$ averages shares at different prices, and with lags today's share has not finished adjusting. So the
+baseline does not correspond to $x=0$ today. To first order the baseline can be off by up to
+$u\cdot(\text{drift})$, e.g.\ $8\%\times5\,\text{bp}=40\%$ under the default $u$. \code{cli.cmd_estimate} reports
+$\max-\min$ of $x$ over the window and warns above 5\,bp.
+
+\subsection{The Excel $x$ in the gap model}
+For a scenario in which our price changes by $\Delta_{us}$ (headline, or $\kappa\times$ discretionary) and
+competitors' effective rates change from $q$ to $q'$,
+\[
+x=\Delta_{us}-\big(\rs(q')-\rs(q)\big),\qquad \rs(q)=-T_k\log\sum_je^{-q_j/T_k},
+\]
+computed from the \code{benchmark} sheet with $T_k=$ \code{softmin_T_bps}. That sheet is written by
+\code{panel.benchmark_snapshot} and holds each lender's last-period \code{eff_bps}, \code{weight} and
+\code{r_star_pct}. For small moves,
+$\rs(q')-\rs(q)\approx\sum_jw_j\Delta q_j$ (Proposition~\ref{prop:softmin}(f)): a competitor's move counts
+in proportion to its weight. In the move model, competitor moves are not modelled and $x=\Delta_{us}$.
+
+\takeaway{Excel turns a price change, relative to the market, into an applications multiplier. It
+assumes the market size and conversion do not change, that today's share is settled at today's price,
+and it shows the full effect once customers have caught up.}
+
+%=====================================================================
+\section{Assumptions and limitations}\label{sec:limits}
+
+\begin{enumerate}
+\item \textbf{Where identification comes from.} \code{beta_post} and \code{beta_pool} use only usable events.
+With few events they stay near the judgment prior, by design: see \code{prior_weight} and
+\code{shared_scale_sd}. They are a test of the judgment, not the main estimate. \code{beta_fe} also uses
+competitor-driven, segment-specific variation in $x$, which is plausibly exogenous to us. But it also uses reactive
+moves (biased toward zero), and its HC1 SEs are too small. \code{beta_hier} uses the same variation with a drifting
+level, so it is the main estimate with competitor data, but it still cannot correct moves made on information that is not yet
+in share (\S\ref{sec:bayes-contrast}). Common moves identify nothing about the level of $\beta$ (Proposition~\ref{prop:common}).
+\item \textbf{Staggered RBA pass-through.} Lag differences between us and competitors create temporary
+gaps in the gap model. If they are the same in every segment, $\delta_t$ absorbs them. Bank-wide moves have no
+controls, so they are not events. In the move model they are demeaned away. A per-cycle RBA
+estimator was deferred.
+\item \textbf{Announcement effects.} Rates enter at their effective date. If borrowers shift timing,
+rushing before a rise or holding off before a cut, $W^-$ and $W^+$ move in opposite directions and $|dy|$ is
+\emph{overstated}. If borrowers respond permanently from the announcement, part of the response falls
+in $W^-$ and $|dy|$ is \emph{understated}. The direction is case-specific.
+\item \textbf{Unseen competitor discounts} attenuate $\beta^{FE}$ through their segment-specific, time-varying part
+(\S\ref{sec:x}), and add unreported noise to event $dx$.
+\item \textbf{The $s_0$ window.} Excel's baseline must be the share at today's price, so check the
+column \code{x_drift_s0_window}.
+\item \textbf{Judgments.} The judgment parameters are $u$, $f$, $\tau$, the $\kappa$ and half-life priors with the 10\% grid rule, $T_k=1/\hat\beta^{FE}_k$ (one
+re-solve), \code{min_dx_bps}, the event windows, $q/r$, the heterogeneity sd $f\beta_{0k}$, and
+forward-filling competitor rates.
+\item \textbf{Model form.} The model assumes a binary logit with constant $\beta_k$ per segment, no outside good, IIA among
+lenders, no spillovers between segments, and independent event estimates.
+\end{enumerate}
+
+\takeaway{The panel estimates (\code{beta_hier}, \code{beta_fe}) learn from every price difference between us and the
+market. The event-based numbers (\code{beta_post}, \code{beta_pool}) are only as good as the usable repricings behind
+them: with few events they are mostly the business's own assumption, and the outputs say how much. Watch for competitor
+entry or exit, announcement timing, and stale baselines.}
+
+\end{document}

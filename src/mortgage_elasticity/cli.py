@@ -1,196 +1,265 @@
-"""Command line entry point:  uv run elasticity {simulate,estimate}"""
+"""Command line entry point:  uv run elasticity
+{simulate,check-moves,estimate,forecast,export-excel,charts,validate,sensitivity}"""
 
 import argparse
-import warnings
+import dataclasses
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from mortgage_elasticity import alpha, events, fe, panel, pool
-from mortgage_elasticity.config import Priors, Settings
-from mortgage_elasticity.model import u_from_beta
+from mortgage_elasticity import panel, runlog
+from mortgage_elasticity.config import Config
+from mortgage_elasticity.runlog import log
+
+
+def _load(args, cfg: Config) -> panel.Prepared:
+    """Read and validate the input files; build the benchmark at the starting temperature."""
+    from mortgage_elasticity.bayes import prior_T
+
+    df = panel.load_panel(Path(args.panel), cfg.date_format, cfg.covariates)
+    segs = list(dict.fromkeys(df["segment"]))
+    ev = panel.load_events(Path(args.events), segs, cfg.date_format)
+    comp, T = None, None
+    if args.competitors:
+        comp = panel.load_competitors(Path(args.competitors), cfg.exclude_lenders,
+                                      df["period"].unique(), cfg.date_format)
+        s0 = df.groupby("segment", sort=False)[["lodg_us", "lodg_mkt"]].sum()
+        T = prior_T((s0["lodg_us"] / s0["lodg_mkt"]).to_numpy(), segs, cfg)
+    prep = panel.prepare(df, ev, comp, T, cfg)
+    log(f"Data: {len(prep.segs)} segments x {len(prep.periods)} weeks "
+        f"({prep.periods[0].date()} to {prep.periods[-1].date()}), {int(prep.obs.sum())} "
+        f"segment-weeks in the likelihood; {len(prep.moves('price'))} own price moves "
+        f"({int(prep.moves('price')['all'].sum())} bank-wide), {len(prep.moves('other'))} logged "
+        f"non-price changes; competitors: {'none' if comp is None else comp['lender'].nunique()}")
+    return prep
+
+
+def _start(out: Path, args, cfg: Config) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    runlog.start()
+    log(f"Run at {datetime.now().isoformat(timespec='seconds')}: "
+        f"{ {k: v for k, v in vars(args).items() if k != 'func'} }")
+    log("Config: " + ", ".join(f"{k}={v}" for k, v in dataclasses.asdict(cfg).items()))
+
+
+def _fit(args):
+    from mortgage_elasticity.bayes import Fit
+    return Fit.load(args.fit)
 
 
 def cmd_simulate(args):
     from mortgage_elasticity.simulate import simulate
-    truth = simulate(Path(args.out), competitors=args.competitors, reactive=args.reactive)
-    files = "panel.csv, events.csv" + (", competitors.csv" if args.competitors else "")
-    print(f"Wrote synthetic {files} to {args.out}")
-    print("True parameters:", truth)
+    truth = simulate(Path(args.out), seed=args.seed, u=args.u, reactive=args.reactive)
+    print(f"Wrote synthetic panel.csv, events.csv, competitors.csv, truth.json to {args.out}: "
+          f"{len(truth['segments'])} segments, {truth['n_price_events']} own price moves, true "
+          f"uplift {truth['u']:.2%}/bp at the pooled share")
 
 
-def _fit(df, ev, s0, beta0, pr, st, args, xkw):
-    """Steps 4a-5a for one benchmark: timing grid, fixed effects, event studies, posteriors."""
-    # 4a fixed effects + grid over kappa / half-lives
-    prior = {"kappa": pr.kappa, "hH": pr.h_headline, "hD": pr.h_discretionary}
-    if args.no_grid:
-        grid, best = pd.DataFrame(), prior
-    else:
-        grid, best, gain = fe.grid_search(df, st.kappa_grid, st.hH_grid, st.hD_grid, prior,
-                                          st.grid_min_gain, **xkw)
-        if best == prior:
-            print(f"Grid winner cuts SSR by only {gain:.1%} vs the priors "
-                  f"(< grid_min_gain {st.grid_min_gain:.0%}): keeping the priors")
-    print(f"Timing/shading used: {best}")
-    dfx = panel.add_perceived_price(df, best["kappa"], best["hH"], best["hD"], **xkw)
-    fe_betas = fe.betas_from_fit(fe.fit_twfe(dfx))
-
-    # 4b event studies
-    es, ev_summary = events.event_study(dfx, ev, st.event_pre, st.event_post, st.min_dx_bps,
-                                        pr.prior_sd_frac * beta0)
-    print(ev_summary)
-    print(f"Usable events: {int(es['clean'].sum())} of {len(es)} estimable "
-          f"({int((es['other_changes'] != '').sum())} have other changes; "
-          f"{int((~es['flagged_clean'].astype(bool)).sum())} flagged clean=FALSE)")
-
-    # 5a prior -> posterior, per segment and pooled across segments
-    post = pool.posterior_betas(s0, es, pr.u, pr.prior_sd_frac)
-    pooled = pool.pooled_betas(s0, es, pr.u, pr.prior_sd_frac, pr.segment_sd_frac)
-    print(f"Shared scale on the u={pr.u:.0%} assumption: {pooled['shared_scale'].iloc[0]:.2f} "
-          f"± {pooled['shared_scale_sd'].iloc[0]:.2f} (from {int(post['n_clean_events'].sum())} "
-          "usable events across all segments)")
-    return grid, best, dfx, fe_betas, es, post, pooled
+def cmd_check_moves(args):
+    from mortgage_elasticity import diagnostics
+    cfg, out = Config(), Path(args.out)
+    _start(out, args, cfg)
+    table = diagnostics.raw_move_check(_load(args, cfg), cfg, out / "check_moves")
+    table.to_csv(out / "check_moves.csv", index=False)
+    if len(table):
+        with pd.option_context("display.float_format", "{:.2f}".format, "display.width", 160):
+            log(table[table["segment"] == "TOTAL"].drop(columns=["segment", "post_weeks"])
+                .to_string(index=False))
+    log(f"Wrote {out / 'check_moves.csv'} and one table and plot per move in {out / 'check_moves'}")
+    runlog.write(out / "check_moves_log.txt")
 
 
 def cmd_estimate(args):
-    pr, st = Priors(), Settings()
-    if not (pr.u > 0 and 0 < pr.segment_sd_frac < pr.prior_sd_frac):
-        raise ValueError("config: need u > 0 and 0 < segment_sd_frac < prior_sd_frac")
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
+    from mortgage_elasticity import bayes, diagnostics
+    cfg, out = Config(), Path(args.out)
+    _start(out, args, cfg)
+    prep = _load(args, cfg)
+    diagnostics.raw_move_check(prep, cfg, out / "check_moves").to_csv(
+        out / "check_moves.csv", index=False)
 
-    # 1-2 panel + diagnostics
-    df = panel.load_panel(Path(args.panel), st.date_format)
-    ev = panel.load_events(Path(args.events), df["segment"].unique(), st.date_format)
-    s0 = panel.baseline_share(df, st.s0_window)
-    beta0 = pr.u / (1 - s0)
-    conv = panel.conversion_report(df)
-    print(f"Panel: {df.segment.nunique()} segments x {df.period.nunique()} periods, {len(ev)} events")
+    fit = bayes.estimate(prep, cfg)
+    fit.save(out / "fit.pkl")
+    _write_outputs(fit, out)
+    runlog.write(out / "run_log.txt")
 
-    # competitor benchmark (gap model); without it x is our own move, demeaned across segments
-    comp, T = None, pd.Series(np.nan, index=s0.index)
-    if args.competitors:
-        comp = panel.load_competitors(Path(args.competitors), st.exclude_lenders,
-                                      df["period"].unique(), st.date_format)
-        T = 1 / beta0 if st.softmin_T_bps is None else pd.Series(st.softmin_T_bps, index=s0.index)
-        df = panel.add_benchmark(df, comp, T, st.comp_ffill_periods, st.min_lenders)
-        snap = panel.benchmark_snapshot(comp, T, df["period"].unique(), st.comp_ffill_periods)
-        n_now = snap.groupby("segment").size()
-        print(f"Benchmark: gap model, T={T.min():.1f}-{T.max():.1f}bp, "
-              f"lenders/segment={n_now.min()}-{n_now.max()}")
-    xkw = {"demean": st.demean_x_by_period}
 
-    grid, best, dfx, fe_betas, es, post, pooled = _fit(df, ev, s0, beta0, pr, st, args, xkw)
-    # MNL: T = 1/beta, so T set from the prior is only right if the prior is. Re-solve once at the
-    # TWFE estimate: unlike beta_pool it doesn't lean on the (thin, mixed-motive) event log.
-    if comp is not None and st.softmin_T_bps is None and st.resolve_T:
-        ok = lambda b: np.isfinite(b) & (b > 0)
-        b_fe = fe_betas.set_index("segment")["beta_fe"].reindex(T.index)
-        b_pool = pooled.set_index("segment")["beta_pool"].reindex(T.index)
-        T_new = (1 / b_fe).where(ok(b_fe), (1 / b_pool).where(ok(b_pool), T))
-        if (~ok(b_fe)).any():
-            warnings.warn("beta_fe not positive: T falls back to 1/beta_pool or 1/beta_prior for "
-                          + ", ".join(map(str, T.index[~ok(b_fe)])))
-        T = T_new
-        df = panel.add_benchmark(df, comp, T, st.comp_ffill_periods, st.min_lenders)
-        snap = panel.benchmark_snapshot(comp, T, df["period"].unique(), st.comp_ffill_periods)
-        print(f"Re-solving T = 1/beta_fe: T={T.min():.1f}-{T.max():.1f}bp. The rest is the second "
-              "pass, the one reported:")
-        grid, best, dfx, fe_betas, es, post, pooled = _fit(df, ev, s0, beta0, pr, st, args, xkw)
+def _write_outputs(fit, out: Path) -> None:
+    from mortgage_elasticity import diagnostics, forecast, report
+    prep, cfg = fit.prep, fit.cfg
+    if fit.T_path is not None:
+        fit.T_path.to_csv(out / "T_path.csv", index=False)
+        log("Soft-min temperature by iteration (bp):\n"
+            + fit.T_path.set_index("segment").round(1).to_string())
+    lo, mid, hi = 100 * np.quantile(
+        np.exp(fit.prior_log_u[:, prep.segs.index(_mid_segment(prep))]), cfg.q)
+    log(f"Prior check: {cfg.interval:.0%} prior interval of u for {_mid_segment(prep)} is "
+        f"{lo:.1f} to {hi:.1f}%/bp (median {mid:.1f})")
 
-    # Excel contract: never rename/remove/reorder these columns; new ones go on the end
-    params = (s0.reset_index().merge(post, on="segment").merge(fe_betas, on="segment", how="left"))
-    params["u_post"] = u_from_beta(params["beta_post"], params["s0"])
-    params["u_fe"] = u_from_beta(params["beta_fe"], params["s0"])
-    params["kappa"], params["h_headline"], params["h_discretionary"] = (
-        best["kappa"], best["hH"], best["hD"])
+    segments = report.segments_table(fit)
+    segments.to_csv(out / "segments.csv", index=False)
+    report.global_table(fit).to_csv(out / "global.csv", index=False)
+    natural = report.natural_share_table(fit)
+    natural.to_csv(out / "natural_share.csv", index=False)
+    report.natural_share_plots(fit, natural, out / "natural_share")
+    accuracy = forecast.accuracy_table(fit)
+    accuracy.to_csv(out / "accuracy.csv", index=False)
+    diagnostics.estimators(fit).to_csv(out / "diagnostics_estimators.csv", index=False)
+    ppc = diagnostics.ppc(fit)
+    ppc.to_csv(out / "diagnostics_ppc.csv", index=False)
 
-    # 5b optional hierarchical (a panel model: it never sees the events or the usable flag)
-    hier = None
-    if args.bayes:
-        from mortgage_elasticity.bayes import fit_hierarchical
-        hier = fit_hierarchical(dfx, s0, pr.u, pr.prior_sd_frac)
-        params = params.merge(hier[["segment", "mean", "sd"]].rename(
-            columns={"mean": "beta_hier", "sd": "beta_hier_sd"}), on="segment", how="left")
+    with pd.option_context("display.float_format", "{:.4f}".format, "display.width", 160):
+        log(segments[["segment", "lodg_us_per_week", "share_now_p50",
+                      *[c for c in segments if c.startswith("u_p")], "T_bps", "n_price_moves",
+                      "prior_share", "thin_volume", "sampler_warning"]].to_string(index=False))
+        log(report.global_table(fit).to_string(index=False))
+    alone = accuracy[accuracy["kind"] == "segment"]
+    for move, g in alone.groupby("move_bps"):
+        log(f"Accuracy, {move:+.0f}bp: {int(g['meets_5pct_price_effect'].sum())} of {len(g)} "
+            f"segments within +/-{cfg.target_apps_rel:.0%} applications (price effect only), "
+            f"{int(g['meets_5pct_full_predictive'].sum())} with drift and sampling noise")
+    log(f"Posterior predictive checks: observed inside the simulated {cfg.interval:.0%} range in "
+        f"{ppc['inside'].mean():.0%} of segment statistics")
+    if segments["thin_volume"].any():
+        log(f"Thin segments (< {cfg.thin_lodgements:.0f} own lodgements a week): "
+            f"{segments.loc[segments['thin_volume'], 'segment'].tolist()}: read them in groups")
+    log(f"Wrote segments.csv, global.csv, natural_share.csv (+ plots), accuracy.csv, "
+        f"diagnostics_*.csv, check_moves.csv, fit.pkl and run_log.txt to {out}")
 
-    params = params.merge(pooled, on="segment", how="left")
-    last = dfx.groupby("segment", sort=False).tail(1).set_index("segment")
-    params["x_basis"] = "gap" if comp is not None else "move"
-    params["softmin_T_bps"] = params["segment"].map(T)
-    params["r_star_now_pct"] = (params["segment"].map(last["r_star_bps"]) / 100
-                                if comp is not None else np.nan)
-    params["n_lenders_now"] = params["segment"].map(n_now) if comp is not None else np.nan
-    # Excel's multiplier treats s0 as the share at today's x: x should be ~flat over the s0 window
-    tail_x = dfx.groupby("segment", sort=False).tail(st.s0_window).groupby("segment")["x"]
-    params["x_drift_s0_window"] = params["segment"].map(tail_x.max() - tail_x.min())
 
-    # 6 natural position
-    track = alpha.track_alpha(dfx, params.set_index("segment")["beta_post"],
-                              st.min_periods_alpha_mle, st.q_over_r)
+def _mid_segment(prep: panel.Prepared) -> str:
+    """A mid-range segment for the prior check: the middle LVR band if present."""
+    mid = prep.dims.index[prep.dims["lvr_band"] == "70-80"]
+    return mid[0] if len(mid) else prep.segs[len(prep.segs) // 2]
 
-    meta = pd.DataFrame({"key": [
-        "run_at", "panel", "events", "competitors", "periods", "x_basis", "softmin_T_bps",
-        "demean_x_by_period", "grid", "bayes",
-    ], "value": [
-        datetime.now().isoformat(timespec="seconds"), args.panel, args.events,
-        args.competitors or "", f"{df.period.min().date()} to {df.period.max().date()}",
-        params["x_basis"].iloc[0],
-        "" if comp is None else (st.softmin_T_bps if st.softmin_T_bps is not None
-                                 else "1/beta_fe per segment" if st.resolve_T
-                                 else "1/beta_prior per segment"),
-        st.demean_x_by_period and comp is None, not args.no_grid, args.bayes,
-    ]})
 
-    # 7 export: Excel reads the `parameters` sheet
-    params.to_csv(out / "parameters.csv", index=False)
-    with pd.ExcelWriter(out / "parameters.xlsx") as xw:
-        params.to_excel(xw, sheet_name="parameters", index=False)
-        es.to_excel(xw, sheet_name="event_estimates", index=False)
-        if len(grid):
-            grid.to_excel(xw, sheet_name="timing_grid", index=False)
-        conv.to_excel(xw, sheet_name="conversion_check", index=False)
-        track.to_excel(xw, sheet_name="natural_share", index=False)
-        if hier is not None:
-            hier.to_excel(xw, sheet_name="hierarchical", index=False)
-        if comp is not None:
-            snap.to_excel(xw, sheet_name="benchmark", index=False)
-        meta.to_excel(xw, sheet_name="meta", index=False)
+def cmd_forecast(args):
+    from mortgage_elasticity.forecast import forecast
+    fit = _fit(args)
+    segments = "ALL" if args.segments.upper() == "ALL" else [
+        s.strip() for s in args.segments.split(";") if s.strip()]
+    changes = {}
+    for item in args.competitor or []:
+        name, _, bps = item.partition("=")
+        seg, _, lender = name.rpartition(":")
+        changes[(seg, lender) if seg else lender] = float(bps)
+    f = forecast(fit, segments, args.headline, args.discretionary, changes or None, args.horizon)
+    lo, hi = (f"p{round(100 * q)}" for q in (fit.cfg.q[0], fit.cfg.q[2]))
+    with pd.option_context("display.float_format", "{:.3f}".format, "display.width", 200):
+        labels = {
+            "price_effect": "PRICE-EFFECT interval (natural share held; no competitor response, "
+                            "no market movement)",
+            "full_predictive": "FULL PREDICTIVE interval (natural share drifts on, counts are "
+                               "noisy)"}
+        for version, label in labels.items():
+            print(f"\n{label}, {fit.cfg.interval:.0%} range ({lo} to {hi}):")
+            g = f.summary[f.summary["version"] == version]
+            print(g[["segment", "dx_bps", *[c for c in g if c.startswith(("multiplier", "share_pp",
+                                                                          "apps_"))]]]
+                  .to_string(index=False))
+        g = f.summary[f.summary["version"] == "price_effect"]
+        print("\nLong-run effect once the move has fully phased in (not the answer for the "
+              "forecast horizon):")
+        print(g[["segment", *[c for c in g if c.startswith("long_run")]]].to_string(index=False))
+    if args.out:
+        out = Path(args.out)
+        out.mkdir(parents=True, exist_ok=True)
+        f.summary.to_csv(out / "forecast.csv", index=False)
+        f.weekly.to_csv(out / "forecast_weekly.csv", index=False)
+        print(f"\nWrote forecast.csv and forecast_weekly.csv to {out}")
 
-    cols = ["segment", "s0", "n_clean_events", "u_post", "beta_post", "beta_pool", "beta_fe",
-            *(["beta_hier"] if hier is not None else []), "prior_weight", "own_weight"]
-    with pd.option_context("display.float_format", "{:.4f}".format, "display.width", 120):
-        print(params[cols].to_string(index=False))
-    for c in ["beta_post", "beta_pool", "beta_fe", *(["beta_hier"] if hier is not None else [])]:
-        bad = params.loc[params[c] <= 0, "segment"].tolist()
-        if bad:
-            warnings.warn(f"{c} <= 0 for {bad}: don't use it in Excel")
-    drift = params.loc[params["x_drift_s0_window"] > 5, "segment"].tolist()
-    if drift:
-        warnings.warn(f"x moved > 5bp within the s0 window for {drift}: s0 is not the share at "
-                      "today's price")
-    print(f"Wrote {out / 'parameters.xlsx'} and parameters.csv")
+
+def cmd_export_excel(args):
+    from mortgage_elasticity.excel import export_excel
+    print(f"Wrote {export_excel(_fit(args), Path(args.out))}")
+
+
+def cmd_charts(args):
+    from mortgage_elasticity import visuals
+    written = visuals.gallery(_fit(args), Path(args.out), args.segment, args.move, args.margin,
+                              outputs=Path(args.fit).parent, truth=args.truth)
+    print(f"Wrote {len(written)} charts to {args.out}")
+
+
+def cmd_validate(args):
+    from mortgage_elasticity import validate
+    fit, out = _fit(args), Path(args.out)
+    _start(out, args, fit.cfg)
+    table = getattr(validate, args.what)(fit)
+    table.to_csv(out / f"validate_{args.what}.csv", index=False)
+    log(f"Wrote {out / f'validate_{args.what}.csv'}")
+    runlog.write(out / f"validate_{args.what}_log.txt")
+
+
+def cmd_sensitivity(args):
+    from mortgage_elasticity import validate
+    fit, out = _fit(args), Path(args.out)
+    _start(out, args, fit.cfg)
+    table = validate.sensitivity(fit)
+    table.to_csv(out / "sensitivity.csv", index=False)
+    with pd.option_context("display.float_format", "{:.4f}".format, "display.width", 160):
+        log(table[table["kind"] == "all"].drop(columns=["kind", "name"]).to_string(index=False))
+    log(f"Wrote {out / 'sensitivity.csv'}")
+    runlog.write(out / "sensitivity_log.txt")
+
+
+def _inputs(p):
+    p.add_argument("--panel", required=True)
+    p.add_argument("--events", required=True)
+    p.add_argument("--competitors", help="competitor rates; without them the gap is our own move")
+    p.add_argument("--out", default="outputs")
+
+
+def _from_fit(p, out="outputs"):
+    p.add_argument("--fit", default="outputs/fit.pkl", help="fit.pkl written by `estimate`")
+    p.add_argument("--out", default=out)
 
 
 def main():
-    warnings.formatwarning = lambda msg, *a, **k: f"WARNING: {msg}\n"
     p = argparse.ArgumentParser(prog="elasticity")
     sub = p.add_subparsers(required=True)
-    s = sub.add_parser("simulate", help="write a synthetic panel + event log")
+    s = sub.add_parser("simulate", help="write a synthetic panel, event log and competitor file")
     s.add_argument("--out", default="data/sample")
-    s.add_argument("--competitors", action="store_true", help="also write competitors.csv")
+    s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--u", type=float, default=0.03, help="true uplift per bp")
     s.add_argument("--reactive", action="store_true",
-                   help="also cut price when volume falls short (logged clean=FALSE)")
+                   help="also cut price where share has slipped")
     s.set_defaults(func=cmd_simulate)
-    e = sub.add_parser("estimate", help="run the estimation pipeline")
-    e.add_argument("--panel", required=True)
-    e.add_argument("--events", required=True)
-    e.add_argument("--competitors", help="competitor rates: switches x to the gap vs the market")
-    e.add_argument("--out", default="outputs")
-    e.add_argument("--no-grid", action="store_true", help="skip the kappa/half-life grid; use priors")
-    e.add_argument("--bayes", action="store_true", help="also fit the PyMC hierarchical model")
-    e.set_defaults(func=cmd_estimate)
+    s = sub.add_parser("check-moves", help="raw-move check: no model; run this first")
+    _inputs(s)
+    s.set_defaults(func=cmd_check_moves)
+    s = sub.add_parser("estimate", help="fit the model and write every output")
+    _inputs(s)
+    s.set_defaults(func=cmd_estimate)
+    s = sub.add_parser("forecast", help="effect of a price change over the next weeks")
+    _from_fit(s, out=None)
+    s.add_argument("--segments", required=True, help="ALL, or segment names separated by ;")
+    s.add_argument("--headline", type=float, required=True, help="headline change, bp (+ = dearer)")
+    s.add_argument("--discretionary", type=float, default=0.0,
+                   help="change in average discount given, bp (+ = less discount)")
+    s.add_argument("--competitor", action="append", metavar="[SEGMENT:]LENDER=BPS",
+                   help="a competitor's rate change in bp; repeatable")
+    s.add_argument("--horizon", type=int)
+    s.set_defaults(func=cmd_forecast)
+    s = sub.add_parser("export-excel", help="write the workbook with live formulas")
+    _from_fit(s, out="outputs/elasticity.xlsx")
+    s.set_defaults(func=cmd_export_excel)
+    s = sub.add_parser("charts", help="write the explanatory charts as PNGs")
+    _from_fit(s, out="outputs/charts")
+    s.add_argument("--segment", help="segment for the single-segment charts (default: largest)")
+    s.add_argument("--move", type=float, default=-10.0, help="example price change, bp")
+    s.add_argument("--margin", type=float,
+                   help="margin on new lending, bp: adds the volume-against-margin illustration")
+    s.add_argument("--truth", help="truth.json of a simulated panel: adds the true sensitivities")
+    s.set_defaults(func=cmd_charts)
+    s = sub.add_parser("validate", help="backtests: refits the model several times")
+    s.add_argument("what", choices=["events", "quiet", "placebo"])
+    _from_fit(s)
+    s.set_defaults(func=cmd_validate)
+    s = sub.add_parser("sensitivity", help="refit under other priors and settings")
+    _from_fit(s)
+    s.set_defaults(func=cmd_sensitivity)
     args = p.parse_args()
     args.func(args)
 

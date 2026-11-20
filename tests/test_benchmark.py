@@ -21,27 +21,24 @@ def test_softmin():
     assert softmin_rate(a, 0)[0] == 600
     assert np.isclose(softmin_rate(a, 1e-6)[0], 600)  # no overflow for tiny T
     assert np.isnan(softmin_rate([[np.nan, np.nan]], T)[0])
+    # bounds: between the cheapest rate less T log N and the cheapest rate
+    assert a.min() - T * np.log(a.size) <= softmin_rate(a, T)[0] <= a.min()
+    assert np.isclose(softmin_rate([[600.0, 1e6]], T)[0], 600)  # stable for a far-off rate
 
 
-def _panel():
-    rows = [{"segment": s, "period": p, "headline_cum_bps": h, "discretionary_cum_bps": d}
-            for s, hs in {"A": [0, -10, -10, -10], "B": [0, 0, 5, 5]}.items()
-            for p, h, d in zip(PERIODS, hs, [0, 0, -10, -10])]
-    return pd.DataFrame(rows)
-
-
-def test_perceived_price_move_path():
-    df = _panel()
-    x = panel.add_perceived_price(df, 0.5, 2.0, 8.0)
+def test_gap_and_perceived_price():
+    df = pd.DataFrame([{"segment": s, "period": p, "headline_cum_bps": h,
+                        "discretionary_cum_bps": d}
+                       for s, hs in {"A": [0, -10, -10, -10], "B": [0, 0, 5, 5]}.items()
+                       for p, h, d in zip(PERIODS, hs, [0, 0, -10, -10])])
     a = df[df.segment == "A"]
-    want = lag(a["headline_cum_bps"], 2.0) + 0.5 * lag(a["discretionary_cum_bps"], 8.0)
-    assert np.allclose(x.loc[a.index, "x"], want)
-    xd = panel.add_perceived_price(df, 0.5, 2.0, 8.0, demean=True)
-    assert np.allclose(xd.groupby("period")["x"].mean(), 0)
-    # gap path: subtract the lagged benchmark move, never demeaned
-    xg = panel.add_perceived_price(df.assign(r_star_bps=600.0 - 10 * (df.period > PERIODS[1])),
-                                   0.5, 2.0, 8.0, demean=True)
-    assert np.allclose(xg.loc[a.index, "x"], want + lag([0, 0, -10, -10], 2.0) * -1)
+    own = a["headline_cum_bps"] + 0.5 * a["discretionary_cum_bps"]
+    assert np.allclose(panel.add_gap(df, 0.5).loc[a.index, "gap_raw"], own)
+    # with a benchmark: its move since the first period is subtracted
+    g = panel.add_gap(df.assign(r_star_bps=600.0 - 10 * (df.period > PERIODS[1])), 0.5)
+    assert np.allclose(g.loc[a.index, "gap_raw"], own - np.array([0, 0, -10, -10]))
+    x = panel.add_perceived_price(g, 2.0)  # one half-life for every component
+    assert np.allclose(x.loc[a.index, "x"], lag(g.loc[a.index, "gap_raw"], 2.0))
 
 
 COMP = pd.DataFrame({

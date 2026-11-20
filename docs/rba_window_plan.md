@@ -1,11 +1,10 @@
 # RBA-window cross-check: implementation plan (not built)
 
-Status: plan only. A cross-check, never the main number and never fed to Excel.
-Note: written while T was re-solved at 1/beta_pool; it is now 1/beta_fe (threat 6 below applies to
-beta_fe instead). Also written before `beta_hier` became the main estimate: `beta_pool` /
-`shared_scale` are the u = 8% judgment, so "pool" below means that judgment, and the check should
-also be read against `beta_hier` / `beta_fe` (step 7). Events are no longer classified by motive:
-usable = no `other_changes` and not vetoed with `clean=FALSE`.
+Status: plan only, and written against the earlier five-estimate design. That design has been
+replaced by one Bayesian state-space model (see `overview.md`), in which the smooth bank-wide trend
+already lets the temporary gaps around RBA moves inform the estimate. `beta_fe`, `beta_pool`,
+`beta_hier`, `shared_scale` and the `clean` flag below no longer exist; read this as background on
+the identification idea, not as a plan against the current code.
 
 ## 0. Bottom line
 

@@ -1,11 +1,10 @@
-"""Event study, fixed effects and grid on small deterministic panels."""
+"""Diagnostic estimators (event study, fixed effects) on small deterministic panels."""
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from mortgage_elasticity import events, fe, panel
-from mortgage_elasticity.simulate import simulate
+from mortgage_elasticity import events, fe
 
 PERIODS = pd.date_range("2025-01-05", periods=30, freq="W-SUN")
 
@@ -66,17 +65,3 @@ def test_twfe_rank_check_and_flat_segment():
     b = fe.betas_from_fit(fe.fit_twfe(df)).set_index("segment")
     assert np.isnan(b.loc["C", "beta_fe"]) and np.isnan(b.loc["C", "beta_fe_se"])
     assert np.isclose(b.loc["A", "beta_fe"], 0.05, atol=0.01)
-    # move model: a segment that never repriced gets a borrowed x after demeaning -> still NaN
-    raw = df.assign(headline_cum_bps=df["x"], discretionary_cum_bps=0.0)
-    dm = panel.add_perceived_price(raw, 0.5, 1.0, 1.0, demean=True)
-    assert np.isnan(fe.betas_from_fit(fe.fit_twfe(dm)).set_index("segment").loc["C", "beta_fe"])
-
-
-def test_grid_keeps_prior_unless_gain_is_large(tmp_path):
-    simulate(tmp_path, seed=3)
-    df = panel.load_panel(tmp_path / "panel.csv")
-    prior = {"kappa": 0.5, "hH": 2.0, "hD": 8.0}
-    grid, best, _ = fe.grid_search(df, (0.3, 0.7), (1.0, 4.0), (8.0,), prior, min_gain=1e9)
-    assert best == prior and len(grid) == 4
-    _, best, _ = fe.grid_search(df, (0.3, 0.7), (1.0, 4.0), (8.0,), prior, min_gain=-1.0)
-    assert best == grid.iloc[0][["kappa", "hH", "hD"]].to_dict()

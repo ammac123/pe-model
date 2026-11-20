@@ -1,219 +1,229 @@
 # mortgage-elasticity
 
-Estimation pipeline for the binary logit share model. Python estimates the parameters;
-Excel reads `parameters.xlsx` and applies
+If we change our rate in a segment by some number of basis points, what happens to our
+broker-channel applications and share over the next 12 weeks, and how sure are we?
 
-```
-beta = u / (1 - s0)                          # or an estimated beta: see "Which beta to use"
-multiplier = 1 / (s0 + (1 - s0) * EXP(beta * x))
-apps = A0 * multiplier
-```
+One Bayesian model answers that. It gives one sensitivity per segment with an 80% range, a
+12-week forecast for any proposed move, and a table that says how accurate those forecasts can be
+on your data. Every number comes with a range; none should be read without it.
+
+- Plain-language description of the model: [`docs/overview.md`](docs/overview.md)
+- Derivations: [`docs/model_maths.pdf`](docs/model_maths.pdf) (source `docs/model_maths.tex`)
 
 ## Quick start
 
 ```bash
-uv sync                                   # create .venv, install deps
-uv run elasticity simulate --competitors  # synthetic panel, events, competitors -> data/sample/
-uv run elasticity estimate --panel data/sample/panel.csv --events data/sample/events.csv \
-    --competitors data/sample/competitors.csv --out outputs/sample
-uv run pytest                             # model, inputs, estimators, pooling, end-to-end tests
+uv sync                                  # create .venv, install dependencies
+uv run elasticity simulate               # synthetic panel, events, competitors -> data/sample/
+IN="--panel data/sample/panel.csv --events data/sample/events.csv --competitors data/sample/competitors.csv"
+uv run elasticity check-moves $IN --out outputs/sample   # no model: look at this first
+uv run elasticity estimate    $IN --out outputs/sample   # about 2-3 minutes on a laptop
+uv run elasticity forecast --fit outputs/sample/fit.pkl --segments "OO_PI_70-80" --headline -10
+uv run elasticity export-excel --fit outputs/sample/fit.pkl --out outputs/sample/elasticity.xlsx
+uv run elasticity charts --fit outputs/sample/fit.pkl --out outputs/sample/charts  # explanatory PNGs
+uv run pytest                            # about 4 minutes; includes small model fits
 ```
 
-Real data (`--competitors` is optional; without it x is our own price move, see below):
+For real data, put the three files in `data/raw/` (not tracked by git) and point the commands
+there.
 
-```bash
-uv run elasticity estimate --panel data/raw/panel.csv --events data/raw/events.csv \
-    --competitors data/raw/competitors.csv --out outputs
-```
+| command | what it does |
+|---|---|
+| `simulate` | writes synthetic inputs with known true sensitivities (`--u`, `--seed`, `--reactive`) |
+| `check-moves` | raw-move check: applications before and after each past price move, against what 8%/bp and 3%/bp imply. No model. Run it first |
+| `estimate` | fits the model and writes every output below |
+| `forecast` | 12-week effect of a move: `--segments ALL` or `"A;B"`, `--headline`, `--discretionary`, `--competitor [SEGMENT:]LENDER=BPS` |
+| `export-excel` | workbook with live formulas for scenario work |
+| `charts` | explanatory charts as PNGs: `--segment`, `--move`, `--margin`, `--truth` (simulated data) |
+| `validate events\|quiet\|placebo` | backtests; each refits the model several times |
+| `sensitivity` | refits under other priors and settings |
 
-Options: `--no-grid` (skip the kappa/half-life search and use the priors in `config.py`),
-`--bayes` (also fit the PyMC hierarchical model, `beta_hier`, the main estimate with competitor
-data; first run `uv sync --extra bayes`, and use `uv run --extra bayes elasticity ...`).
-`simulate --reactive` also cuts price whenever volume falls short. It logs those cuts as
-`clean=FALSE`, as if you had vetoed them. If you log them as usable, `beta_post` / `beta_pool` come
-out about 17% low.
+`forecast`, `export-excel`, `charts`, `validate` and `sensitivity` read the `fit.pkl` that `estimate` wrote.
 
-Exploratory work: `uv add --dev jupyter` then `uv run jupyter lab`.
+## Reading the outputs
+
+### `segments.csv`: one row per segment
+
+| column | how to read it |
+|---|---|
+| `u_p10`, `u_p50`, `u_p90` | **The sensitivity.** The percentage rise in our volume per 1bp cut, as a fraction (0.03 = 3% per bp). `u_p50` is the best single figure. There is a 4-in-5 chance the truth lies between `u_p10` and `u_p90`, and a 1-in-5 chance it does not |
+| `prior_share` | **How much of that answer is judgment.** 0 means the data decided it. 1 means the data said nothing and the figure is just the starting assumption (3%/bp, range 1.2 to 7.4). Above about 0.5, treat the segment's number as mostly judgment |
+| `share_now_*` | our fitted share of market lodgements in the latest week |
+| `beta_*`, `T_bps` | the same sensitivity in the units the formulas use, and the benchmark's "softness" (see the overview) |
+| `n_price_moves` | how many logged own price moves touched this segment |
+| `thin_volume` | TRUE below 50 own lodgements a week. Week-to-week chance alone then moves volumes by more than ±5%, so read thin segments in groups |
+| `conversion`, `conv_cv`, `conv_trend_per_period_pct` | applications per lodgement over the last 13 weeks, and whether that ratio is stable. If it trends, a change in lodgement share is not quite a change in applications |
+| `sampler_warning`, `u_rhat`, `u_ess` | TRUE means the numerical fit for this segment is not trustworthy; see `run_log.txt` |
+
+A segment with few price moves of its own still gets a usable figure, because segments that share
+a purpose, repayment type or LVR band inform each other.
+
+### `accuracy.csv`: what the tool can and cannot promise
+
+For every segment and group (all, by purpose, by repayment type, by LVR band) and for moves of
+±5, ±10 and ±25bp, it gives the half-width of the 80% range of the 12-week forecast: for
+applications as a percentage (`apps_halfwidth_rel_*`) and for share in percentage points
+(`share_halfwidth_pp_*`). `meets_5pct_*` and `meets_0p3pp_*` say whether that is inside the
+business targets of ±5% and ±0.3 points.
+
+There are two versions of every column:
+
+- `*_price_effect`: our natural share stays where it is today. This is the "no competitor response
+  and no market movement" condition. The range reflects only how well we know the sensitivity, the
+  speed of response and today's level.
+- `*_full_predictive`: natural share also keeps drifting as it has in the past, and weekly counts
+  are noisy. This is the range to expect when comparing a forecast with what actually happens.
+
+Expect the target to be met for small moves in large segments and in groups, and missed for 25bp
+moves and thin segments. Nothing is tuned to make this table pass. An 80% range is exceeded one
+time in five by design.
+
+### Other files
+
+- `global.csv`: the half-life of a price move in weeks (`h`), the typical uplift
+  (`mu_u_pct_per_bp`), how investor (`a_inv`), interest-only (`a_io`) and LVR-band (`c_lvr[...]`)
+  segments differ, the weekly drift of natural share (`sigma_g` bank-wide, `sigma_v` per
+  segment) and the count-noise parameter `c`.
+- `natural_share.csv` and `natural_share/*.png`: per segment and week, actual share, fitted share
+  and **natural share**: the share we would have had if our price gap to the market had stayed
+  where it started. Turnaround time, credit policy, service and brand all sit in it. Price moves
+  and logged non-price changes are marked on the charts.
+- `check_moves.csv` and `check_moves/`: one table and chart per past price move.
+- `diagnostics_estimators.csv`: the model's `u` beside two older estimators (two-way fixed effects
+  and event studies), each with its known bias. They are checks; they do not feed the estimate.
+- `diagnostics_ppc.csv`: whether data simulated from the fitted model wobbles and persists from
+  week to week as the real share does.
+- `T_path.csv`: the benchmark temperature per iteration.
+- `run_log.txt`: the configuration, data counts, exclusions, sampler diagnostics and every warning.
+  **Read the warnings.** `UNRELIABLE RUN` and `SOFT-MIN TEMPERATURE DID NOT CONVERGE` mean the
+  numbers should not be used as they stand.
+
+### Charts and the explorer notebook
+
+- [`notebooks/model_explorer.ipynb`](notebooks/model_explorer.ipynb): try price and competitor
+  scenarios and see the model in pictures, with a plain-language reading of each chart and the
+  formula behind it. Open it in VS Code or Jupyter with the `.venv` kernel and run from the top;
+  cells headed `# SETTINGS` are the ones to edit. It reads `fit.pkl` and the csv tables of one run.
+- `uv run elasticity charts` writes the same charts as PNGs. They come from
+  `mortgage_elasticity/visuals.py`: how the model works (response curve, delay, benchmark), what
+  it learned (sensitivity by segment, share history), scenarios in one, two and three dimensions
+  (move size, segment by move, our move against a competitor's, move size against time), and how
+  far to trust it (raw moves, backtests, precision, judgment checks). `--margin` adds a
+  volume-against-margin illustration from a margin you supply; it is not a model output.
+
+### `forecast`
+
+Two ranges are printed, labelled:
+
+- **Price-effect interval**: as in the accuracy table, natural share held.
+- **Full predictive interval**: with drift and count noise. Its multiplier is the simulated
+  scenario divided by the central no-change forecast.
+
+Each gives the 12-week applications multiplier, 12-week share in percentage points and 12-week
+applications, at the 10th, 50th and 90th percentile. The weekly path is in `forecast_weekly.csv`
+(`--out`). A move phases in: at a two-week half-life only about 80% of it is felt on average over
+the first 12 weeks. The steady-state multiplier is shown separately as the long-run effect and is
+not the 12-week answer. The baseline continues any recent move that has not finished phasing in.
+
+### `elasticity.xlsx`
+
+- `segments`: `share_now`, `beta` at p10/p50/p90, `T_bps`, `h_p50`, conversion, `prior_share`.
+- `benchmark`: each competitor's latest effective rate and weight. Type a new rate into the
+  yellow `scenario_rate_pct` column to model a competitor move.
+- `scenario`: type our headline and discretionary change (yellow cells, bp, + = dearer) per
+  segment. The sheet works out the change in our gap to the market, the weekly multipliers, their
+  12-week average at the low, middle and high sensitivity, and the long-run multiplier. Its range
+  is the **80% range from sensitivity only**. It assumes past moves have fully phased in and uses
+  the middle half-life, so it is narrower than `forecast`. A test checks it against `forecast`
+  to within 0.5%.
 
 ## Inputs
 
-Dates are ISO (`yyyy-mm-dd`) unless `Settings.date_format` is set (e.g. `"%d/%m/%Y"`).
-Unparseable dates, blanks, duplicates and unbalanced panels are errors, not warnings.
+Dates are ISO (`yyyy-mm-dd`) unless `date_format` is set in `config.py`. Schema errors, our
+lodgements above the market's, negative or fractional counts, duplicate rows, unparseable dates
+and unbalanced panels stop the run with a message. Weeks where we had no lodgements are kept.
+Weeks where the market had none are left out and counted in the log.
 
-**`panel.csv`**: one row per segment x period (weekly or monthly, no gaps, every segment the same
-periods).
+**`panel.csv`**: one row per segment and week, every segment covering the same weeks.
 
 | column | meaning |
 |---|---|
-| `segment` | segment id, identical definition in our data and market data (no `[` or `]`) |
-| `period` | period END date |
-| `lodg_mkt` | market lodgements in the segment |
-| `lodg_us` | our lodgements in the segment |
-| `apps` | our applications (used for the conversion check) |
-| `headline_cum_bps` | cumulative headline rate change since panel start (bps, + = dearer) |
-| `discretionary_cum_bps` | cumulative change in average discretionary discount given (bps, + = dearer, i.e. less discount) |
+| `segment` | `PURPOSE_REPAYMENT_LVRBAND`: purpose `OO` or `INV`, repayment `PI` or `IO`, LVR band `<=60`, `60-70`, `70-80`, `80-90` or `>90`. Example: `OO_PI_70-80`. The model pools sensitivity across these three dimensions, so the name must carry them |
+| `period` | week END date |
+| `lodg_mkt`, `lodg_us` | market and our lodgements, broker channel |
+| `apps` | our applications |
+| `headline_cum_bps` | cumulative change in our carded rate since the panel start (bp, + = dearer) |
+| `discretionary_cum_bps` *(optional)* | cumulative change in our average discretionary discount (bp, + = less discount). If absent it is treated as zero, the log says so, and the model sees carded moves only |
 
 Our rates must use the same convention as the competitor rates: the **day-weighted average over
-the period**, not the rate on the period end date. Mixing the two creates false gaps around every
-RBA move.
+the week**, not the rate on the week-end date. Mixing the two creates false gaps around every RBA
+move.
 
-**`events.csv`**: one row per repricing.
-
-| column | meaning |
-|---|---|
-| `segment`, `period` | where and when. An event dated inside a period counts in that period (the first period end on or after the date); events after the last period are dropped |
-| `reason` | stated reason (funding cost, competitor, volume shortfall, ...) |
-| `other_changes` *(optional)* | anything else that changed in the segment around the move: campaign, broker incentive, credit policy, turnaround... Blank or `none` if nothing. A move with other changes is reported but doesn't update beta: its share response can't be put down to price |
-| `clean` *(optional, default TRUE)* | set FALSE to keep a move out of the beta update (TRUE/FALSE, 1/0, yes/no). You don't need to classify motives |
-| `d_headline_bps`, `d_discretionary_bps` *(optional)* | size of the move (informational only) |
-
-Moves made in every segment at once (e.g. passing on an RBA change) can be left out: they have no
-control segments, and they already enter through x.
-
-A campaign or other change with **no** price move can be logged too (give a `reason`, put it in
-`other_changes`, sizes 0). It produces no estimate, but keeps those weeks out of the noise
-estimate, and keeps that segment out of the comparison group for other moves at the time.
-
-**`competitors.csv`** *(optional, `--competitors`)*: each eligible competitor's rate, one row per
-period x segment x lender. Alternatively, a change log with `effective_date` instead of `period`
-(one row per rate change). It is converted to the day-weighted average rate over each period. A
-lender's rate before its first change row is unknown.
+**`events.csv`**: one row per change.
 
 | column | meaning |
 |---|---|
-| `period` (or `effective_date`), `segment`, `lender` | one row per lender; collapse to its best effective product first (duplicates are an error) |
-| `rate_pct` | the lender's rate in percent (e.g. 6.19) |
-| `adj_bps` *(optional, default 0)* | value to the customer not in the rate (cashback etc.), bps; + lowers the effective rate |
-| `eligible` *(optional, default TRUE)* | FALSE rows are ignored |
+| `date` | when. A date inside a week counts in that week |
+| `segments` | `ALL` for bank-wide, or segment names separated by `;` |
+| `type` | `price` for an own price move, `other` for anything else: campaign, credit policy, commission, turnaround change |
+| `description` | free text |
 
-Settings: `exclude_lenders`, `comp_ffill_periods` (how long a missing rate is carried forward),
-`min_lenders` (warn below), `softmin_T_bps`.
+Log every `other` change you know of. Each one lets natural share jump once in the affected
+segments from that week. A price move in the same week as a logged `other` change then teaches
+the model little, which is the intent. An abrupt change you do not log is read as price response
+if it coincides with a price move.
 
-## The price the customer sees (x)
+**`competitors.csv`** *(optional, but the model is much weaker without it)*: one row per lender,
+segment and week, or a change log with `effective_date` instead of `period` (one row per rate
+change, converted to the day-weighted weekly average).
 
-- **Gap model** (with `--competitors`): the market benchmark is the soft-min of the competitors'
-  effective rates, `r* = -T log sum_j exp(-(rate_j - adj_j) / T)` (the logit inclusive value).
-  `T` = `1 / beta` per segment: the run starts at `1 / beta_prior`, then re-solves once at
-  `1 / beta_fe` and estimates again (`Settings.resolve_T`; `Settings.softmin_T_bps` fixes one
-  `T` for all segments, `0` = cheapest lender). `beta_fe` is used because it doesn't depend on the
-  event log, which is thin and mostly mixed-motive; a segment with no positive `beta_fe` falls back
-  to `1 / beta_pool`, then `1 / beta_prior` (with a warning).
-  A lender entering lowers r*, so a changing number of competitors moves r* even when no rate
-  moves (the pipeline warns). Then `x = lag(headline) + kappa lag(discretionary) - lag(r* - r*_first)`.
-- **Move model** (no competitor file): x is our own move, minus its mean across segments in each
-  period (`Settings.demean_x_by_period`). This stops RBA moves that everyone passes on from
-  looking like price changes that didn't hurt volume. It also removes our own bank-wide moves,
-  which can't be told apart from market moves without competitor data. Competitors' own moves are
-  invisible here, so expect noisier betas than the gap model.
+| column | meaning |
+|---|---|
+| `period` (or `effective_date`), `segment`, `lender` | one row per lender; collapse to its best effective product first |
+| `rate_pct` | carded rate in percent (e.g. 6.19) |
+| `adj_bps` *(optional, default 0)* | value to the customer not in the rate, bp, + = cheaper. **This is where your manual adjustments go** (cashback, known discounting). They move the price variable directly, so keep a dated record of them |
+| `eligible` *(optional, default TRUE)* | FALSE rows get no weight |
 
-## Pipeline (`elasticity estimate`)
+## Judgment settings (`config.py`)
 
-| step | module | what it does |
+Every judgment parameter is in `config.py` with a one-line description. The ones that matter most:
+
+| setting | default | meaning |
 |---|---|---|
-| 1-2 | `panel.py` | validate inputs, share, logit share, baseline s0, conversion check, competitor benchmark r*, x |
-| 3 | `config.py` | judgment priors: u = 8%/bp, prior sd, segment sd, kappa, half-lives |
-| 4a | `fe.py` | two-way fixed effects `y = alpha_k + delta_t - beta_k x`, grid over kappa / half-lives |
-| 4b | `events.py` | difference-in-differences per event vs segments not repriced in the window |
-| 5a | `pool.py` | prior -> posterior per segment (`beta_post`) and pooled across segments (`beta_pool`), using only usable events (no other changes, not vetoed) |
-| 5b | `bayes.py` | optional hierarchical panel model in PyMC (`beta_hier`, the main estimate with competitor data) |
-| 6 | `alpha.py` | natural position over time (inversion + local-level Kalman), beta held fixed at `beta_post` |
-| 7 | `cli.py` | writes `parameters.xlsx` / `.csv` |
+| `prior_u_median`, `prior_u_log_sd` | 0.03, 0.70 | starting assumption for uplift per bp: middle 3%, 80% range 1.2 to 7.4%. 8%/bp sits at about the 92nd percentile: possible, not assumed |
+| `kappa` | 0.5 | share of a discretionary-discount change that counts as price |
+| `prior_h_median` | 2 weeks | starting assumption for the half-life of a move; the data update it |
+| `softmin_T_bps` | `None` | `None` solves the benchmark temperature from the data; a number fixes it |
+| `time_effect` | `"rw"` | smooth bank-wide trend. `"fe"` (free week effects) is for sensitivity runs only |
+| `interval` | 0.80 | the range reported everywhere |
 
-## Outputs (`<out>/parameters.xlsx`)
+`uv run elasticity sensitivity` shows how far the answer moves when the prior middle is 2, 4 or
+8%/bp, the temperature is halved or doubled, `kappa` is 0.3 or 0.7, week dummies replace the
+smooth trend, or jumps are switched off.
 
-- `parameters`: per segment `s0`, `beta_prior`, `n_clean_events` (usable events), `beta_post`
-  (+ 90% interval), `u_post`, `beta_fe`, `prior_weight` (how much of the answer is still
-  judgment), `kappa`, half-lives (`beta_hier` + `beta_hier_sd` too if `--bayes` was used). Then, appended: `beta_pool` (+ sd, 90% interval),
-  `u_pool`, `shared_scale` (+ sd), `own_weight`, `x_basis` (`move`/`gap`), `softmin_T_bps`,
-  `r_star_now_pct`, `n_lenders_now`, `x_drift_s0_window`. **Excel contract:** existing columns are
-  never renamed, removed or reordered; new ones only go on the end.
-- `event_estimates`: every estimable event with its beta estimate and SE, snapped period,
-  `own_events_in_window`, `other_changes`, `flagged_clean` (your flag as given) and `clean`: the
-  event is **usable** for updating beta (`n_clean_events` counts these). The run prints how many
-  events were dropped and why.
-- `timing_grid`: SSR across kappa / half-life combos. The grid winner is used only if it cuts SSR
-  by at least `grid_min_gain` (10%) against the priors; otherwise the priors are kept.
-- `conversion_check`: if `conv_trend_per_period_pct` or `conv_cv` is large, lodgement share is a poor
-  proxy for application share in that segment.
-- `natural_share`: natural share by segment over time (Kalman-smoothed with 24+ periods, filtered below that).
-- `benchmark` (gap model): last period's competitor rates and each lender's weight in r*.
-- `meta`: input paths, period range, x basis, T, flags, run time.
+## Validation
 
-## Which beta to use
-
-Most own repricings are mixed-motive (strategy, volume, competitors), and only a handful are
-usable events. So the panel estimates, which learn from every change in our price *relative to
-competitors*, should carry the weight. The event-based ones are the u = 8% judgment updated by
-logged moves. With few moves logged, they mostly restate the judgment. If you log every mixed-motive
-move (`clean` defaults to TRUE), they also pick up the bias from moves made because share had
-slipped: about -16 to -18% in simulation.
-
-With competitor rates (`--competitors`):
-
-- `beta_hier` (`--bayes`): **the main estimate.** A panel model that lets each segment's level
-  drift, so a move made because share had already fallen is measured against where share had
-  fallen to, not against its long-run average. In simulation it stayed close to the truth when we
-  cut price whenever share fell: 0.95-1.12 × truth across 4 runs with competitor data, while
-  `beta_fe` was 0.77-1.11. Its 90% intervals covered the truth 22 of 24 times without those cuts
-  and 19 of 24 with them.
-  - The run warns if sampling looks unreliable (r_hat > 1.01, ess < 400, or any divergences): check
-    the `hierarchical` sheet.
-  - With frequent reactive cuts the warning fired in every simulation, yet the estimates were good
-    (r_hat at most 1.02). So treat a mild warning as "check it against `beta_fe`". If r_hat is above
-    about 1.05, don't use it.
-- `beta_fe`: **the cross-check.** It learns from the same variation without the drifting level.
-  - Competitors' moves alone are enough for it: in simulation with none of our own moves it came
-    out at 1.02 × truth.
-  - It is biased towards zero when our moves react to share and the shortfalls persist: about
-    0.5 × truth in 3 of 4 such simulations.
-  - So if it is well below `beta_hier`, suspect that.
-  - `beta_fe_se` (HC1) is badly over-confident when share drifts. Don't build intervals from it.
-- `beta_pool` / `beta_post`: the judgment, updated by the few usable events.
-  - Use `shared_scale` as a test of the u = 8% assumption: if its 90% interval
-    (±1.645 × `shared_scale_sd`) excludes 1, the assumption is off across the board.
-  - `beta_pool` pools usable events from all segments; with none it is exactly the prior.
-    `beta_post` uses each segment's own events only.
-  - Simulation with 0-1 usable events per segment (20 seeds): when u was ~50% too high, relative
-    RMSE was prior 75%, `beta_post` 61%, `beta_pool` 38%. When u was right on average but segments
-    differed by ±30-50%, it was `beta_post` 28%, `beta_pool` 30-33%.
-  - `Priors.segment_sd_frac` (default 0.15) decides how far a segment may differ from the shared
-    pattern. Raise it (e.g. 0.25) if segments plausibly differ a lot, e.g. fixed vs variable.
-
-Without competitor rates, x is only our own moves, so every estimate rests on mixed-motive
-decisions. Prefer `beta_hier` for the reason above, and treat all of them as rough.
-
-If the estimates disagree a lot, look at `event_estimates` and the `hierarchical` sheet before
-trusting any of them. The run warns if any `beta_post`, `beta_pool`, `beta_fe` or `beta_hier` is <= 0, or if x moved
-more than 5bp inside the s0 window (`x_drift_s0_window`): Excel's multiplier assumes s0 is the share at today's price.
+| command | what it shows |
+|---|---|
+| `check-moves` | whether applications moved after past moves as an assumed uplift implies |
+| `validate events` | for each past move: refit without the 12 weeks after it, then compare the predicted 12-week lodgements with what happened, given the competitor rates and market volumes that occurred |
+| `validate quiet` | 12-week forecasts from a new starting point every 13 weeks, on segments we did not reprice: the error floor from drift and sampling |
+| `validate placebo` | a fake 10bp move at a quiet date should show no effect about 4 times in 5 |
+| `sensitivity` | see above |
+| `scripts/acceptance.py` | simulated data with known truth: does the 80% range contain the truth about 80% of the time? Results: [`docs/acceptance.md`](docs/acceptance.md) |
 
 ## Caveats
 
-- Identification:
-  - Moves common to every segment are absorbed by the period effects. This includes pass-through
-    timing that is the same in all our segments, e.g. "we passed the RBA cut on 10 days after the
-    majors". Only timing differences that vary by segment (ours or competitors') inform beta_fe.
-    An RBA-window cross-check is planned but not built: see
-    [`docs/rba_window_plan.md`](docs/rba_window_plan.md).
-  - Competitor discounts we can't see are measurement error in r*, which biases beta towards zero.
-  - Customers and brokers react when a change is announced, not only when it takes effect. Rates
-    are entered as at their effective date, so the weeks between announcement and effective date
-    can show odd share moves that aren't price responses.
-- Which events update beta (`clean` in `event_estimates`): an event is biased if something the model
-  can't see moved share in the same weeks as the price. Every move is partly strategy, volume and
-  competitor reaction, so we don't ask for a motive, and there is no data screen. A check on share
-  drifting before each move was tried and dropped: in simulation it barely told moves made after
-  share slipped (4-5% flagged) from random ones (3%). Log simultaneous changes (campaigns, broker
-  incentives) in `other_changes`: any entry makes the event unusable. `clean=FALSE` is a veto.
-- The event SE comes from placebo windows (same DiD on windows with no event and no price move),
-  so it captures drift and autocorrelation. It falls back to first differences if there are fewer
-  than 10 such windows. It adds a heterogeneity term when the controls' x also moved.
-- HC1 standard errors are used instead of clustering by segment, because there are too few segments
-  for clustered SEs to be reliable.
-- The synthetic data is cleaner than real lodgement data (2 years weekly, known timing).
-- Don't re-estimate beta inside the alpha filter (step 6).
-
-## Documentation
-
-- [`docs/overview.md`](docs/overview.md): plain-language, step-by-step description of the model.
-- [`docs/model_maths.pdf`](docs/model_maths.pdf) (source `docs/model_maths.tex`): technical
-  derivations. Section N expands step N of the overview.
+- The smooth bank-wide trend lets bank-wide price moves inform the estimate. It rests on one
+  assumption: no other abrupt bank-wide shock lands in the same weeks as a bank-wide price move,
+  unless you log it.
+- Competitor discounts we cannot see blur the benchmark and bias sensitivity towards zero.
+  `adj_bps` is the only defence.
+- The benchmark temperature `T` and the sensitivity depend on each other and are jointly weakly
+  identified. The `sensitivity` run reports how the answer moves when `T` is halved and doubled.
+- Turnaround time is inside natural share by design. If a price cut causes a surge that slows
+  turnaround, the estimated sensitivity is the net effect of both.
+- Customers and brokers react when a change is announced, not only when it takes effect.
+- The synthetic data is cleaner than real lodgement data.
+- [`docs/rba_window_plan.md`](docs/rba_window_plan.md) is an older, unbuilt plan written against
+  the previous five-estimate design.

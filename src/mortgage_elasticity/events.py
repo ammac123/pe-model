@@ -1,4 +1,5 @@
-"""Step 4b: difference-in-differences event studies on logit share.
+"""Diagnostic only: difference-in-differences event studies on logit share.
+Nothing here feeds the estimate (bayes.py); diagnostics.py reports it beside the model's u_k.
 
 For an event in segment k at period t_e:
     dy  = (mean y_post - mean y_pre)_k  -  same for control segments (no event in the window)
@@ -7,8 +8,8 @@ For an event in segment k at period t_e:
 
 `period` is the period END: an event dated mid-period lands in the first panel period >= its date.
 
-`clean` = usable for updating beta = no `other_changes` logged AND the user's own flag (kept as
-`flagged_clean`, a veto).
+Rows are one own price move in one segment (diagnostics.py builds them from the event log).
+`clean` = no logged non-price change in the window (`other_changes`).
 """
 
 import warnings

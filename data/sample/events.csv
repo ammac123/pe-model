@@ -1,19 +1,16 @@
-segment,period,d_headline_bps,d_discretionary_bps,reason,clean
-INV_IO,2025-01-26,0.0,-15.0,funding cost,True
-INV_IO,2025-05-04,10.0,0.0,funding cost,True
-INV_IO,2025-12-21,5.0,0.0,funding cost,True
-INV_PI,2024-12-29,-10.0,0.0,funding cost,True
-INV_PI,2025-08-10,0.0,10.0,funding cost,True
-INV_PI,2025-11-30,0.0,10.0,funding cost,True
-OO_FIX2,2025-12-28,-10.0,0.0,funding cost,True
-OO_FIX2,2026-02-22,0.0,-15.0,funding cost,True
-OO_FIX2,2026-04-19,-10.0,0.0,funding cost,True
-OO_IO,2025-01-19,0.0,15.0,funding cost,True
-OO_IO,2026-01-11,0.0,-15.0,funding cost,True
-OO_IO,2026-04-12,-10.0,0.0,funding cost,True
-OO_PI_LVR80,2024-09-29,10.0,0.0,funding cost,True
-OO_PI_LVR80,2025-05-11,10.0,0.0,funding cost,True
-OO_PI_LVR80,2026-03-22,-10.0,0.0,funding cost,True
-OO_PI_LVR90,2025-01-12,0.0,-10.0,funding cost,True
-OO_PI_LVR90,2025-06-01,5.0,0.0,funding cost,True
-OO_PI_LVR90,2026-01-11,10.0,0.0,funding cost,True
+date,segments,type,description
+2024-09-01,ALL,price,RBA pass-through
+2024-10-27,INV_PI_<=60;INV_PI_60-70;INV_PI_70-80;INV_PI_80-90;INV_PI_>90;INV_IO_<=60;INV_IO_60-70;INV_IO_70-80;INV_IO_80-90;INV_IO_>90,price,segment repricing (headline)
+2024-12-01,ALL,other,broker campaign
+2025-01-05,ALL,price,bank-wide repricing (discretionary)
+2025-02-23,ALL,price,bank-wide repricing (discretionary)
+2025-04-06,ALL,price,RBA pass-through
+2025-06-01,INV_PI_<=60;INV_PI_60-70;INV_PI_70-80;INV_PI_80-90;INV_PI_>90;INV_IO_<=60;INV_IO_60-70;INV_IO_70-80;INV_IO_80-90;INV_IO_>90,price,segment repricing (discretionary)
+2025-07-06,OO_IO_<=60;OO_IO_60-70;OO_IO_70-80;OO_IO_80-90;OO_IO_>90;INV_IO_<=60;INV_IO_60-70;INV_IO_70-80;INV_IO_80-90;INV_IO_>90,other,credit policy change
+2025-08-10,OO_PI_>90;OO_IO_>90;INV_PI_>90;INV_IO_>90,price,segment repricing (headline)
+2025-09-14,INV_PI_<=60;INV_PI_60-70;INV_PI_70-80;INV_PI_80-90;INV_PI_>90;INV_IO_<=60;INV_IO_60-70;INV_IO_70-80;INV_IO_80-90;INV_IO_>90,price,segment repricing (discretionary)
+2025-09-14,OO_PI_<=60;OO_PI_60-70;OO_PI_70-80;OO_PI_80-90;OO_PI_>90;OO_IO_<=60;OO_IO_60-70;OO_IO_70-80;OO_IO_80-90;OO_IO_>90,other,commission change
+2025-11-02,OO_PI_80-90;INV_IO_<=60,price,segment repricing (headline)
+2026-01-04,OO_PI_<=60;OO_PI_60-70;OO_PI_70-80;OO_PI_80-90;OO_PI_>90;INV_PI_<=60;INV_PI_60-70;INV_PI_70-80;INV_PI_80-90;INV_PI_>90,price,segment repricing (headline)
+2026-02-08,ALL,price,bank-wide repricing (headline)
+2026-03-22,ALL,price,bank-wide repricing (headline)
